@@ -1,3 +1,6 @@
 [submodule "libbpf"]
 	path = libbpf
 	url = https://github.com/libbpf/libbpf.git
+[submodule "redis"]
+	path = redis
+	url = git@github.com:redis/redis.git
