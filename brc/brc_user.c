@@ -1,0 +1,267 @@
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <signal.h>
+#include <time.h>
+#include <assert.h>
+#include <errno.h>
+#include <sys/resource.h>
+#include <linux/if_link.h>
+#include <linux/limits.h>
+
+#include <bpf/libbpf.h>
+#include "brc_kern.bpf.skel.h"
+
+#define STATS_PATH "/tmp/brc_stats.txt"
+#define STATS_INTERVAL_PATH "/tmp/brc_stats_interval.txt"
+
+struct bpf_progs_desc {
+	char name[256];
+	enum bpf_prog_type type;
+    int pin;
+	int map_prog_idx;
+	struct bpf_program *prog;
+};
+
+static struct bpf_progs_desc progs[] = {
+	{"brc_rx_filter",       BPF_PROG_TYPE_XDP,      0, -1,                          NULL},
+	{"brc_hash_keys",       BPF_PROG_TYPE_XDP,      0, BRC_PROG_XDP_HASH_KEYS,      NULL},
+    {"bmc_prepare_packet",  BPF_PROG_TYPE_XDP,      0, BRC_PROG_XDP_PREPARE_PACKET, NULL},
+	{"brc_write_reply",     BPF_PROG_TYPE_XDP,      0, BRC_PROG_XDP_WRITE_REPLY,    NULL},
+	{"brc_maintain_tcp",    BPF_PROG_TYPE_XDP,      0, BRC_PORG_XDP_MAINTAIN_TCP,   NULL},
+    {"brc_invalidate_cache",BPF_PROG_TYPE_XDP,      0, BRC_PROG_XDP_INVALIDATE_CACHE, NULL},
+    {"brc_tx_filter",       BPF_PROG_TYPE_SCHED_CLS,1, -1,                          NULL},
+    {"brc_update_cache",    BPF_PROG_TYPE_SCHED_CLS,0, BRC_PROG_TC_UPDATE_CACHE,    NULL},
+};
+
+static int cpu_nums = 0;
+
+
+static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args) {
+	return vfprintf(stderr, format, args);
+}
+
+static volatile bool exiting = false;
+
+static void sig_handler(int sig) {
+	exiting = true;
+}
+int write_stats_to_file(char *filename, int map_fd) {
+
+}
+
+int write_stat_line(FILE *fp, int map_fd) {
+
+}
+
+int main(int argc, char **argv) {
+    struct rlimit mem_limit = {RLIM_INFINITY, RLIM_INFINITY};
+	struct trace_bpf *skel;
+    int map_xdp_progs_fd, map_tc_progs_fd, main_prog_fd, prog_count, map_progs_fd;
+    int xdp_main_fd, tc_main_fd;
+    // 目前写死，后续可以再修改
+    int interface_idx;
+    __u32 xdp_flags = 0;
+    int stats_poll_count = 5, stats_poll_interval = 5;
+	int err;
+
+	// 设置一些debug信息的回调
+	libbpf_set_print(libbpf_print_fn);
+
+	// libbpf不会默认调节锁定的内存
+	if (setrlimit(RLIMIT_MEMLOCK, &mem_limit)) {
+		perror("setrlimit failed");
+		return 1;
+	}
+
+	signal(SIGINT, sig_handler);
+	signal(SIGTERM, sig_handler);
+
+	// Load and verify BPF application 
+	skel = trace_bpf__open();
+	if (!skel) {
+		fprintf(stderr, "Failed to open and load BPF skeleton\n");
+		return 1;
+	}
+
+	// Load and verify BPF programs 
+	err = trace_bpf__load(skel);
+	if (err) {
+		fprintf(stderr, "Failed to load and verify BPF skeleton\n");
+		goto cleanup;
+	}
+
+    //======================填充progs数组====================================
+    prog_count = sizeof(progs) / sizeof(progs[0]);
+    for (int i = 0; i < prog_count; i++) {
+		progs[i].prog = bpf_object__find_program_by_title(skel->obj, progs[i].name);
+		if (!progs[i].prog) {
+			fprintf(stderr, "Error: bpf_object__find_program_by_title failed\n");
+			return 1;
+		}
+		bpf_program__set_type(progs[i].prog, progs[i].type);
+    }
+    //===================================================================
+
+    //======================用于尾调用====================================
+    map_xdp_progs_fd = bpf_object__find_map_fd_by_name(skel->obj, "xdp_progs");
+	if (map_xdp_progs_fd < 0) {
+		fprintf(stderr, "Error: bpf_object__find_map_fd_by_name failed\n");
+		return 1;
+	}
+
+	map_tc_progs_fd = bpf_object__find_map_fd_by_name(skel->obj, "tc_progs");
+	if (map_tc_progs_fd < 0) {
+		fprintf(stderr, "Error: bpf_object__find_map_fd_by_name failed\n");
+		return 1;
+	}
+    //===================================================================
+
+    //======================用于填充prog_map==============================
+    for (int i = 0; i < prog_count; i++) {
+        int prog_fd = bpf_program__fd(progs[i].prog);
+		if (prog_fd < 0) {
+			fprintf(stderr, "Error: Couldn't get file descriptor for program %s\n", progs[i].name);
+			return 1;
+		}
+        // -1指的是主程序
+		if (progs[i].map_prog_idx != -1) {
+            switch (progs[i].type) {
+            case BPF_PROG_TYPE_XDP:
+                map_progs_fd = map_progs_xdp_fd;
+                break;
+            case BPF_PROG_TYPE_SCHED_CLS:
+                map_progs_fd = map_progs_tc_fd;
+                break;
+            default:
+                fprintf(stderr, "Error: Program type doesn't correspond to any prog array map\n");
+                return 1;
+            }
+            // 给 progs map 的 map_prog_idx 插入 prog_fd
+			err = bpf_map_update_elem(map_progs_fd, &progs[i].map_prog_idx, &prog_fd, 0);
+			if (err) {
+				fprintf(stderr, "Error: bpf_map_update_elem failed for prog array map\n");
+				return 1;
+			}
+		} else if (progs[i].pin) {  // TC相关
+            
+        }
+    }
+    //===================================================================
+
+    //============================brc_rx_filter载入================================
+    // ip link看下 暂时硬编码
+    interface_idx = 2;
+    xdp_main_fd = bpf_object__find_map_fd_by_name(skel->obj, "brc_rx_filter");
+    // 通用的挂载模式
+    xdp_flags |= XDP_FLAGS_DRV_MODE;
+    if (bpf_set_link_xdp_fd(interface_idx, xdp_main_fd, xdp_flags) < 0) {
+        fprintf(stderr, "Error: bpf_set_link_xdp_fd failed for interface %d\n", interface_idx);
+        return 1;
+    } else {
+        printf("Main BPF program attached to XDP on interface %d\n", interface_idx);
+    }
+    //===================================================================
+
+    //============================brc_tx_filter载入================================
+    tc_main_fd = bpf_object__find_map_fd_by_name(skel->obj, "brc_rx_filter");
+
+    struct bpf_tc_hook tc_main_hook = {
+            .attach_point = BPF_TC_EGRESS, 
+            .ifindex = interfaces_idx};
+    struct bpf_tc_opts tc_main_opts = {
+            .handle = 1,    // 重要吗
+            .priority = 1, 
+            .prog_fd = tc_main_fd}
+
+    if (bpf_tc_hook_create(&tc_main_hook) == -EINVAL) {
+        fprintf(stderr, "bpf_tc_hook_create invalid hook ifindex == 0\n");
+        return 1;
+    }
+
+    if (bpf_tc_attach(&tc_main_hook, &tc_main_opts) == -EINVAL) {
+        fprintf(stderr, "bpf_tc_attach invalid hook ifindex == 0\n");
+        goto cleanup;
+    }
+    //===================================================================
+
+    //============================注册对应的信号处理函数================================
+    cpu_nums = libbpf_num_possible_cpus();
+
+	sigset_t signal_mask;
+	sigemptyset(&signal_mask);
+	sigaddset(&signal_mask, SIGINT);
+	sigaddset(&signal_mask, SIGTERM);
+
+	err = sigprocmask(SIG_BLOCK, &signal_mask, NULL);
+	if (err != 0) {
+		fprintf(stderr, "Error: Failed to set signal mask\n");
+		exit(EXIT_FAILURE);
+	}
+
+	int sig, cur_poll_count = 0, quit = 0;
+	FILE *fp = NULL;
+
+	if (stats_poll_count > 0 && stats_poll_interval > 0) {
+		fp = fopen(STATS_INTERVAL_PATH, "w+");
+		if (fp == NULL) {
+			fprintf(stderr, "Error: failed to open file '%s'\n", STATS_INTERVAL_PATH);
+			return -1;
+		}
+		// 隔这么长时间触发一次SIGALRM信号
+		alarm(stats_poll_interval);
+	}
+
+	while (!quit) {
+        // 是否可能出现信号丢失的情况
+		err = sigwait(&signal_mask, &sig);
+		if (err != 0) {
+			fprintf(stderr, "Error: Failed to wait for signal\n");
+			exit(EXIT_FAILURE);
+		}
+
+		switch (sig) {
+			case SIGINT:
+			case SIGTERM:
+				// 按了 ctrl+c 以后就把map_stats中的数据写到目标文件中
+				ret = write_stats_to_file(STATS_PATH, map_stats_fd);
+				quit = 1;
+				break;
+
+			case SIGALRM:
+				ret |= write_stat_line(fp, map_stats_fd);
+				if (++cur_poll_count < stats_poll_count) {
+					alarm(stats_poll_interval);
+				} else {
+					ret |= write_stats_to_file(STATS_PATH, map_stats_fd);
+					if (fp != NULL) {
+						fclose(fp);
+					}
+					quit = 1;
+				}
+				break;
+			default:
+				fprintf(stderr, "Unknown signal\n");
+				break;
+		}
+	}
+
+cleanup:
+	// Clean up
+    if (bpf_tc_hook_destroy(&tc_main_hook) == -EINVAL) {
+        fprintf(stderr, "bpf_tc_hook_destroy invalid hook ifindex == 0\n");
+        return 1;
+    }
+
+    struct bpf_tc_opts opts = {
+            .handle = 1,
+            .priority = 1}
+
+    if (bpf_tc_detach(&tc_main_hook, &opts) == -EINVAL) {
+        fprintf(stderr, "bpf_tc_detach invalid hook ifindex == 0\n");
+        return 1;
+    }
+	trace_bpf__destroy(skel);
+
+	return err < 0 ? -err : 0;
+}
