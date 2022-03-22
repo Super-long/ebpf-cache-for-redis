@@ -188,6 +188,11 @@ retry:
     // ip link看下 暂时硬编码
     interface_idx = 2;
     xdp_main_fd = bpf_object__find_map_fd_by_name(skel->obj, "xdp/brc_rx_filter");
+	if (xdp_main_fd < 0) {
+		fprintf(stderr, "Error: bpf_object__find_map_fd_by_name failed\n");
+		return 1;
+	}
+
     // 通用的挂载模式
     xdp_flags |= XDP_FLAGS_DRV_MODE;
     if (bpf_set_link_xdp_fd(interface_idx, xdp_main_fd, xdp_flags) < 0) {
@@ -199,6 +204,8 @@ retry:
     //============================================================================
 
     //============================brc_tx_filter载入================================
+	// https://elixir.bootlin.com/linux/latest/source/tools/testing/selftests/bpf/prog_tests/tc_bpf.c#L36
+	// https://lwn.net/Articles/856041/
     // tc_main_fd = bpf_object__find_map_fd_by_name(skel->obj, "tc/brc_rx_filter");
 
     // struct bpf_tc_hook tc_main_hook = {

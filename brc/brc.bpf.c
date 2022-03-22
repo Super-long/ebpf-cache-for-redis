@@ -125,8 +125,26 @@ int brc_invalidate_cache_main(struct xdp_md *ctx) {
 
 SEC("tc/brc_tx_filter")
 int brc_tx_filter_main(struct __sk_buff *skb) {
-	char fmt[] = "---------brc_tx_filter_main--------\n";
-	bpf_trace_printk(fmt, sizeof(fmt));
+	// btf_bpf_tcp_sock
+	void *data_end = (void *)(long)skb->data_end;
+	void *data     = (void *)(long)skb->data;
+	struct ethhdr *eth = data;
+	struct iphdr *ip = data + sizeof(*eth);
+	struct udphdr *udp = data + sizeof(*eth) + sizeof(*ip);
+	char *payload = data + sizeof(*eth) + sizeof(*ip) + sizeof(*udp);
+	unsigned int zero = 0;
+
+	// 大于cache中允许的最大长度，直接返回错误
+	if (skb->len > BRC_MAX_CACHE_DATA_SIZE + sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr))
+		return 0;
+
+	if (ip + 1 > data_end)
+		return XDP_PASS;
+
+	if (ip->protocol != IPPROTO_UDP)
+		// 结束处理过程，放行
+		return 0;
+
 	return 0;
 	//return TC_ACT_OK;
 }
