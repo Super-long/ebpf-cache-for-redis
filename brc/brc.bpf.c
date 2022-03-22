@@ -1,8 +1,10 @@
+#include "vmlinux.h"	// 必须放在首位
+
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
+//#include "../libbpf/include/uapi/linux/pkt_cls.h"
 
-#include "vmlinux.h"
 #include "bpf_helpers.h"
 #include "brc_common.h"
 
@@ -77,42 +79,61 @@ struct parsing_context {
 	unsigned short write_pkt_offset;
 };
 
-SEC("brc_rx_filter")
-int brc_rx_filter_main(struct xdp_md *ctx) {
+struct brc_cache_entry {
+	struct bpf_spin_lock lock;
+	unsigned int len;
+	char valid;
+	int hash;
+	char data[BRC_MAX_CACHE_DATA_SIZE];
+};
 
+SEC("xdp/brc_rx_filter")
+int brc_rx_filter_main(struct xdp_md *ctx) {
+	char fmt[] = "---------brc_rx_filter_main--------\n";
+	bpf_trace_printk(fmt, sizeof(fmt));
+	return XDP_PASS;
 }
 
-SEC("brc_hash_keys")
+SEC("xdp/brc_hash_keys")
 int brc_hash_keys_main(struct xdp_md *ctx) {
 
+	return XDP_PASS;
 }
 
-SEC("brc_prepare_packet")
+SEC("xdp/brc_prepare_packet")
 int brc_prepare_packet_main(struct xdp_md *ctx) {
 
+	return XDP_PASS;
 }
 
-SEC("brc_write_reply")
+SEC("xdp/brc_write_reply")
 int brc_write_reply_main(struct xdp_md *ctx) {
 
+	return XDP_PASS;
 }
 
-SEC("brc_maintain_tcp")
-int brc_maintain_tcp(struct xdp_md *ctx) {
+SEC("xdp/brc_maintain_tcp")
+int brc_maintain_tcp_main(struct xdp_md *ctx) {
 
+	return XDP_PASS;
 }
 
-SEC("brc_invalidate_cache")
+SEC("xdp/brc_invalidate_cache")
 int brc_invalidate_cache_main(struct xdp_md *ctx) {
-
+	return XDP_PASS;
 }
 
-SEC("brc_tx_filter")
+SEC("tc/brc_tx_filter")
 int brc_tx_filter_main(struct __sk_buff *skb) {
-
+	char fmt[] = "---------brc_tx_filter_main--------\n";
+	bpf_trace_printk(fmt, sizeof(fmt));
+	return 0;
+	//return TC_ACT_OK;
 }
 
-SEC("brc_update_cache")
+SEC("tc/brc_update_cache")
 int brc_update_cache_main(struct __sk_buff *skb) {
 
+	return 0;
+	//return TC_ACT_OK;
 }

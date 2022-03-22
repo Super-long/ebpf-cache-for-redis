@@ -24,15 +24,6 @@ enum {
 };
 
 // 用于与客户端交互，所以需要放到common中来
-
-struct brc_cache_entry {
-	struct bpf_spin_lock lock;
-	unsigned int len;
-	char valid;
-	int hash;
-	char data[BRC_MAX_CACHE_DATA_SIZE];
-};
-
 struct brc_stats {
 	unsigned int get_recv_count;			// 接收的get数
 	unsigned int set_recv_count;			// 接收的set数
