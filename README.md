@@ -14,7 +14,7 @@
 4. clang -Wall -O2 -g trace.o /root/exercise/libbpf-bootstrap/examples/c/.output/libbpf.a  -lelf -lz -o trace  
 
 # 执行
-现在在用户态挂载的时候有一个大问题，就是bpf_tc_hook_create不太成熟，资料较少，所以使用object pin先把TC bpf挂载，然后再手动挂载TC程序,我倾向于使用更低级别的接口,但是捣鼓了一周没搞出来,后续看下libbpf源码
+现在在用户态挂载的时候有一个大问题，就是bpf_tc_hook_create不太成熟，资料较少，所以使用object pin先把TC bpf挂载，然后再手动挂载TC程序,我倾向于使用更低级别的接口,但是捣鼓了两天没搞出来,后续看下libbpf源码
 1. cd .bin
 2. ./brc
 3. tc qdisc add dev eth0 clsact 
@@ -32,12 +32,15 @@ https://redis.io/topics/protocol
 ## 批量回复
 支持二进制安全字符串
 > "*3\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$7\r\nmyvalue\r\n"
+
 > "$6\r\nfoobar\r\n"
+
 > "$-1\r\n"
 
 ## 整数回复
 `:` 之后就是整数
 > :0\r\n
+
 > :1000\r\n
 
 
@@ -48,6 +51,7 @@ https://redis.io/topics/protocol
 ## 错误回复
 `-`之后代表错误类型，ERR 是一个通用错误，而 WRONGTYPE 则是一个更特定的错误，之后为内容
 > -Error message\r\n
+
 > -WRONGTYPE Operation against a key holding the wrong kind of value\r\n
 
 ## 数组回复
