@@ -16,14 +16,14 @@ char LICENSE[] SEC("license") = "Dual BSD/GPL";
  **/ 
 struct {
 	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-	__uint(max_entries, 33);
+	__uint(max_entries, RECURSION_UPPER_LIMIT);
 	__type(key, u32);
 	__type(value, u32);
 } xdp_progs SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-	__uint(max_entries, 33);
+	__uint(max_entries, RECURSION_UPPER_LIMIT);
 	__type(key, u32);
 	__type(value, u32);
 } tc_progs SEC(".maps");
@@ -36,10 +36,10 @@ struct {
 	__type(key, u32);
 	__type(value, struct brc_cache_entry);
 	__uint(max_entries, BRC_CACHE_ENTRY_COUNT);
-} map_kcache SEC(".maps");
+} map_cache SEC(".maps");
 
 /*
- * @brief: 因为使用的是尾调用，所以需要在解析多个key时维护以解析的数据
+ * @brief: 用于在ingress中把get的key保存，在egress中
  **/
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -55,7 +55,7 @@ struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__type(key, unsigned int);
 	__type(value, struct brc_stats);
-	__uint(max_entries, 1);
+	__uint(max_entries, MAP_STATS_MAX);
 } map_stats SEC(".maps");
 
 struct parsing_context;
@@ -63,8 +63,16 @@ struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__type(key, unsigned int);
 	__type(value, struct parsing_context);
-	__uint(max_entries, 1);
+	__uint(max_entries, PARSING_MAX);
 } map_parsing_context SEC(".maps") ;
+
+struct brc_cache_key;
+struct {
+	__uint(type, BPF_MAP_TYPE_QUEUE);
+	__type(key, 0);
+	__type(value, struct brc_cache_key);
+	__uint(max_entries, BRC_CACHE_QUEUE_SIZE);
+} map_invaild_key SEC(".maps") ;
 
 struct redis_key {
 	u32 hash;
@@ -72,22 +80,30 @@ struct redis_key {
 	unsigned int len;
 };
 
+// 因为redis协议的返回值无法自解释，但是我们又希望维护内核态和用户态的一致性，所以设置一个BPF_MAP_TYPE_QUEUE
+struct brc_cache_key {
+	struct bpf_spin_lock lock;
+	unsigned int len;
+	char key[BRC_MAX_KEY_LENGTH];	// 为了在hash相同的时候判断是否是同一个key
+};
+
 struct parsing_context {
-	unsigned int value_size;
+	unsigned int value_size;	// 在brc_rx_filter也可以代表key的大小
 	unsigned short read_pkt_offset;
-	unsigned short write_pkt_offset;
 };
 
 struct brc_cache_entry {
 	struct bpf_spin_lock lock;
-	unsigned int len;
+	unsigned int key_len;
+	unsigned int data_len;
 	char valid;
 	int hash;
+	char key[BRC_MAX_KEY_LENGTH];	// 为了在hash相同的时候判断是否是同一个key
 	char data[BRC_MAX_CACHE_DATA_SIZE];
 };
 
-SEC("xdp/brc_rx_filter")
-int brc_rx_filter_main(struct xdp_md *ctx) {
+SEC("tc/brc_rx_filter")
+int brc_rx_filter_main(struct __sk_buff *skb) {
 	// static struct bpf_sock *(*bpf_skc_lookup_tcp)(void *ctx, struct bpf_sock_tuple *tuple, __u32 tuple_size, __u64 netns, __u64 flags) = (void *) 99;
 	// libbpf/src/bpf_helper_defs.h xdp/tc 支持 bpf_skc_lookup_tcp
 	// https://elixir.bootlin.com/linux/v5.17/source/tools/testing/selftests/bpf/progs/test_btf_skc_cls_ingress.c#L94 调用bpf_skc_lookup_tcp的例子
@@ -96,16 +112,162 @@ int brc_rx_filter_main(struct xdp_md *ctx) {
 	// static struct bpf_tcp_sock *(*bpf_tcp_sock)(struct bpf_sock *sk) = (void *) 96;
 	// libbpf/src/bpf_helper_defs.h 支持 bpf_tcp_sock,这里返回的结构体才是需要修改的,但是只支持tc,所以看起来这里也需要使用tc
 
+	// https://elixir.bootlin.com/linux/v5.10.13/source/tools/testing/selftests/bpf/bpf_tcp_helpers.h#L53 bpf_sock定义
+
 	// btf_bpf_tcp_sock
-	char fmt[] = "---------brc_rx_filter_main--------\n";
-	bpf_trace_printk(fmt, sizeof(fmt));
-	return XDP_PASS;
+	// =============================================
+	void *data_end = (void *)(long)skb->data_end;
+	void *data = (void *)(long)skb->data;
+	struct ethhdr *eth = data;
+	struct iphdr *ip = data + sizeof(*eth);
+	if (ip + 1 > data_end) {
+		return 0;
+	}
+	void *transp = data + sizeof(*eth) + sizeof(*ip);
+	struct tcphdr *tcp = (struct tcphdr *) transp;
+	if (tcp + 1 > data_end) {
+		return 0;
+	}
+	int payload_size = skb->len - (sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr));
+	__be16 dport;
+	dport = tcp->dest;
+	char *payload = transp + sizeof(*tcp);
+
+	// 经过上面的循环拿到目的端口和payload相关，payload是真实数据包的起始地址
+	if (dport == htons(6379) && payload+14 <= data_end) {
+		// 目前只支持get
+		// "*2\r\n$3\r\nget\r\n$13\r\nusername:1234\r\n"
+		// 前八个字节亘古不变
+		if (ip->protocol == IPPROTO_TCP && 
+			payload[9] == 'g' && payload[10] == 'e' && payload[11] == 't' && payload[12] == '\r' && payload[13] == '\n') { // is this a GET request
+			unsigned int map_stats_index = MAP_STATS;
+			unsigned int parsing_egress = PARSING_INGRESS;
+			// 如果一个目标端口的TCP包来了，而且是get请求，就会更新map_stats表中的数据
+			struct brc_stats *stats = bpf_map_lookup_elem(&map_stats, &map_stats_index);
+			if (!stats) {
+				return 0;
+			}
+			stats->get_recv_count++;
+
+			// 解析上下文
+			struct parsing_context *pctx = bpf_map_lookup_elem(&map_parsing_context, &parsing_egress);
+			if (!pctx) {
+				return XDP_PASS;
+			}
+			// 14这个下标上应该是'$'
+			pctx->read_pkt_offset = 14;
+			pctx->value_size = 0;
+
+			// "*2\r\n$3\r\nget\r\n$13\r\nusername:1234\r\n"
+			if (payload[pctx->read_pkt_offset] == '$') {
+				pctx->read_pkt_offset++;	// 现在pctx->read_pkt_offset是数字的第一个字符的下标
+				while (pctx->read_pkt_offset < payload_size && payload[pctx->read_pkt_offset] != '\r' && 
+					payload[pctx->read_pkt_offset] >= '0' && payload[pctx->read_pkt_offset] <= '9') {
+					pctx->value_size *= 10;
+					pctx->value_size += payload[pctx->read_pkt_offset] - '0';
+					pctx->read_pkt_offset++;
+				}
+			} else {
+				return 0;
+			}
+
+			if (pctx->read_pkt_offset >= payload_size || pctx->value_size > BRC_MAX_KEY_LENGTH) {
+				stats->big_key_pass_to_user++;
+				return 0;
+			}
+			// 目前value_size是key的大小,read_pkt_offset是key的第一个字节
+			bpf_tail_call(skb, &tc_progs, BRC_PROG_XDP_HASH_KEYS);
+		} else if (ip->protocol == IPPROTO_TCP) {
+			// 非get请求就会来这里,set会把标记设置为invaild
+			bpf_tail_call(skb, &tc_progs, BRC_PROG_XDP_INVALIDATE_CACHE);
+		}
+	}
+	return 0;
 }
 
-SEC("xdp/brc_hash_keys")
-int brc_hash_keys_main(struct xdp_md *ctx) {
+// 这里主要做的事情是通过get中的key计算hash值
+// cache中是vaild就返回，如果是invaild就放入全局cache，等到get返回的时候获取key的值
+// 在egress可能接收到set的返回值和get的返回值，前者我们忽略，那后者一定都是invaild以后去用户态拿数据的请求了
+// 因为redis的单线程模型，所以这里使用一个队列来解决redis协议无法自解释的问题看起来是OK的
+SEC("tc/brc_hash_keys")
+int brc_hash_keys_main(struct __sk_buff *skb) {
+	void *data_end = (void *)(long)skb->data_end;
+	void *data     = (void *)(long)skb->data;
+	struct ethhdr *eth = data;
 
-	return XDP_PASS;
+	struct iphdr *ip = data + sizeof(*eth);
+	if (ip->protocol != IPPROTO_TCP || ip + 1 > data_end) {
+		return 0;
+	}
+	unsigned int map_stats_index = MAP_STATS;
+	unsigned int parsing_egress = PARSING_INGRESS;
+	
+	struct parsing_context *pctx = bpf_map_lookup_elem(&map_parsing_context, &parsing_egress);
+	if (!pctx) {
+		return 0;
+	}
+	struct tcphdr *tcp = data + sizeof(*eth) + sizeof(*ip);
+	char *payload = data + sizeof(*eth) + sizeof(*ip) + sizeof(*tcp) + pctx->read_pkt_offset;
+	
+	u32 hash = FNV_OFFSET_BASIS_32;
+	// 目前payload的第一个字节就是key实际值的第一个字节
+	// value_size是key的大小
+#pragma clang loop unroll(disable)
+	for (int i = 0; i < pctx->value_size; ++i) {
+		hash ^= payload[i];
+		hash *= FNV_PRIME_32;
+	}
+
+	u32 cache_idx = hash % BRC_CACHE_ENTRY_COUNT;
+	struct brc_cache_entry *entry = bpf_map_lookup_elem(&map_cache, &cache_idx);
+	if (!entry) {
+		return 0;
+	}
+	// 到了这里证明是个get操作，如果发现是invaild的，就把数据放入queue;如果是vaild的话就直接继续执行尾调用
+	bpf_spin_lock(&entry->lock);
+
+	// hash相同且字符串也一样证明找对了;vaild准备返回相关的事务;invaild pass 到用户态处理
+	if (entry->valid) {
+		// 这个标识代表在hash相同是判断key是否相同
+		bool diff = true;
+		if (pctx->value_size != entry->key_len) {
+			diff = false;
+		}
+		for (int i = 0; i < pctx->value_size && diff; ++i) {
+			if (payload[i] != entry->key[i]) {
+				diff = false;
+				break;
+			}
+		}
+		if (entry->hash == hash && diff) {
+			bpf_spin_unlock(&entry->lock);
+			bpf_tail_call(skb, &tc_progs, BRC_PROG_XDP_PREPARE_PACKET);
+		}
+		// 能到这里证明对应entry有效，但是于get中的key不匹配
+	} else {
+		// entry是无效的，pass到用户态处理
+		bpf_spin_unlock(&entry->lock);
+		struct redis_key key_entry = {
+			.hash = hash,
+			.len = pctx->value_size
+		};
+		for (int i = 0; i < pctx->value_size; ++i) {
+			key_entry.key_data[i] = payload[i];
+		}
+		// 用于debug
+		key_entry.key_data[pctx->value_size] = '\n';
+
+		// 栈上的变量直接塞进去可以？得测试一下
+		bpf_map_update_elem(&map_invaild_key, NULL, &key_entry ,BPF_ANY);
+	}
+
+	struct brc_stats *stats = bpf_map_lookup_elem(&map_stats, &map_stats_index);
+	if (!stats) {
+		return 0;
+	}
+	stats->miss_count++;
+
+	return 0;
 }
 
 SEC("xdp/brc_prepare_packet")
@@ -152,7 +314,10 @@ int brc_tx_filter_main(struct __sk_buff *skb) {
 	// TCP的包头可能不止20字节，但是tcphdr中看起来是定长的
 	char *payload = data + sizeof(*eth) + sizeof(*ip) + sizeof(*tcp);
 	int payload_size = skb->len - sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr);
-	unsigned int zero = 0;
+	struct redis_key key_entry;
+	unsigned int map_stats_index = MAP_STATS;
+	unsigned int parsing_egress = PARSING_EGRESS;
+
 
 	// 数据包太小，也直接返回
 	if (tcp + 1 > data_end)
@@ -165,27 +330,29 @@ int brc_tx_filter_main(struct __sk_buff *skb) {
 	// 这个版本不能把尾调用和bpf to bpf结合使用就只能把解析也放在这个尾调用里面了
 	// "$6\r\nfoobar\r\n"
 	if (sport == htons(6379) && payload[0] == '$') {
-		// step1:先解析出数字，然后向后推一个/r/n，然后在执行尾调用
-		struct parsing_context *pctx = bpf_map_lookup_elem(&map_parsing_context, &zero);
+		// step1:先解析出数字，然后向后推一个/r/n，然后再执行尾调用
+		struct parsing_context *pctx = bpf_map_lookup_elem(&map_parsing_context, &parsing_egress);
 		pctx->value_size = 0;
 		pctx->read_pkt_offset = 0;
 		if (!pctx) {
+			bpf_map_lookup_and_delete(&map_invaild_key, NULL, &key_entry);
 			return 0;
 		}
 		pctx->read_pkt_offset = 1;	// '$'
+		
 		// "$-1\r\n"
+		// 一个get请求从客户端没读到自己希望的数据，那在全局cache中也需要一次delete操作 
 		if (payload[pctx->read_pkt_offset] == '-') {
+			bpf_map_lookup_and_delete(&map_invaild_key, NULL, &key_entry);
 			return 0;
 		}
-		
+		// 那剩下的就是invaild的get操作，且确实从用户态获取到值了，这就需要尝试更新内核cache了
+#pragma clang loop unroll(disable)
 		while (pctx->read_pkt_offset < payload_size && payload[pctx->read_pkt_offset] != '\r' && 
 			payload[pctx->read_pkt_offset] >= '0' && payload[pctx->read_pkt_offset] <= '9') {
 			pctx->value_size *= 10;
 			pctx->value_size += payload[pctx->read_pkt_offset] - '0';
 			pctx->read_pkt_offset++;
-		}
-		if(payload[pctx->read_pkt_offset] < '0' && payload[pctx->read_pkt_offset] > '9') {
-			return 0;
 		}
 
 		if (pctx->read_pkt_offset < payload_size && pctx->read_pkt_offset + 1 < payload_size &&
@@ -195,8 +362,9 @@ int brc_tx_filter_main(struct __sk_buff *skb) {
 		// 现在 pctx->read_pkt_offset 的位置就是数据的第一个字节,且value_size是数据的实际大小
 
 		// step2:更新map_stats状态
-		struct brc_stats *stats = bpf_map_lookup_elem(&map_stats, &zero);
+		struct brc_stats *stats = bpf_map_lookup_elem(&map_stats, &map_stats_index);
 		if (!stats) {
+			bpf_map_lookup_and_delete(&map_invaild_key, NULL, &key_entry);
 			return 0;
 		}
 		stats->try_update++;
@@ -211,7 +379,83 @@ int brc_tx_filter_main(struct __sk_buff *skb) {
 
 SEC("tc/brc_update_cache")
 int brc_update_cache_main(struct __sk_buff *skb) {
+	void *data_end = (void *)(long)skb->data_end;
+	void *data = (void *)(long)skb->data;
+	unsigned int map_stats_index = MAP_STATS;
+	unsigned int parsing_egress = PARSING_EGRESS;
+	struct redis_key key_entry;
+	struct parsing_context *pctx = bpf_map_lookup_elem(&map_parsing_context, &parsing_egress);
+
+	char *payload = (data + sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr) + pctx->read_pkt_offset);
+	u32 hash = FNV_OFFSET_BASIS_32;
+	// ==========================================
+	char fmt[] = "redis get reply(read_offset=%d, payload=%s, data=%s)\n";
+	bpf_trace_printk(fmt, sizeof(fmt), pctx->read_pkt_offset, payload, data);
+	// ==========================================
+
+	// 获取此get返回值对应的key
+	bpf_map_lookup_and_delete(&map_invaild_key, NULL, &key_entry);
+	// compute the key hash
+#pragma clang loop unroll(disable)
+	// hash算法为FNV-1a 
+	// "$6\r\nfoobar\r\n"
+	// step1:找到此key对应的hash_index
+	for (unsigned int off = 0; off < key_entry.len; off++) {
+		hash ^= key_entry.key_data[off];
+		hash *= FNV_PRIME_32;
+	}
+	u32 cache_idx = hash % BRC_CACHE_ENTRY_COUNT;
+
+	struct brc_cache_entry *entry = bpf_map_lookup_elem(&map_cache, &cache_idx);
+	if (!entry) {
+		return 0;
+	}
+
+	// 加锁，因为可能出现并发处理；我们认为最新的数据更可能被访问
+//	bpf_spin_lock(&entry->lock);
+
+// 	int diff = 0;
+// #pragma clang loop unroll(disable)
+// 	// 比较cache中的老数据和现在的数据是否相同
+// 	for (int i = 0; i < key_entry.len; ++i) {
+// 		if (key_entry.key_data[i] != entry->key[i]) {
+// 			diff = 1;
+// 			break;
+// 		}
+// 	}
+
+// 	if (diff == 1) {
+// 		// hash虽然相同，但是key不相同
+// 		bpf_spin_unlock(&entry->lock);
+// 		return 0;
+// 	}
+//	bpf_spin_unlock(&entry->lock);
+// 上面比较数据实际是否一致在这里不重要，在get要在内核被提前处理时比较重要
+
+	bpf_spin_lock(&entry->lock);
+	// step2: 只要vaild是0，我们就会全量的替换
+	if (!entry->valid) { 
+		entry->valid = 1;
+		entry->hash = hash;
+
+		entry->key_len = key_entry.len;
+		for(int i = 0; i < key_entry.len; ++i) {
+			entry->key[i] = key_entry.key_data[i];
+		}
+
+		entry->data_len = pctx->value_size;
+		for(int i = 0; i < pctx->value_size; ++i) {
+			entry->data[i] = payload[i];
+		}
+
+		bpf_spin_unlock(&entry->lock);
+		struct brc_stats *stats = bpf_map_lookup_elem(&map_stats, &map_stats_index);
+		if (!stats) {
+			return 0;
+		}
+		stats->update_count++;
+	}
+
 
 	return 0;
-	//return TC_ACT_OK;
 }

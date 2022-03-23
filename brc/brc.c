@@ -28,14 +28,14 @@ struct bpf_progs_desc {
 };
 
 static struct bpf_progs_desc progs[] = {
-	{"xdp/brc_rx_filter",       BPF_PROG_TYPE_XDP,      0, -1,                          NULL},
-	{"xdp/brc_hash_keys",       BPF_PROG_TYPE_XDP,      0, BRC_PROG_XDP_HASH_KEYS,      NULL},
-    {"xdp/brc_prepare_packet",  BPF_PROG_TYPE_XDP,      0, BRC_PROG_XDP_PREPARE_PACKET, NULL},
-	{"xdp/brc_write_reply",     BPF_PROG_TYPE_XDP,      0, BRC_PROG_XDP_WRITE_REPLY,    NULL},
-	{"xdp/brc_maintain_tcp",    BPF_PROG_TYPE_XDP,      0, BRC_PORG_XDP_MAINTAIN_TCP,   NULL},
-    {"xdp/brc_invalidate_cache",BPF_PROG_TYPE_XDP,      0, BRC_PROG_XDP_INVALIDATE_CACHE, NULL},
-    {"tc/brc_tx_filter",       	BPF_PROG_TYPE_SCHED_CLS,1, -1,                          NULL},
-    {"tc/brc_update_cache",		BPF_PROG_TYPE_SCHED_CLS,0, BRC_PROG_TC_UPDATE_CACHE,    NULL},
+	{"tc/brc_rx_filter",       	BPF_PROG_TYPE_SCHED_CLS,	1, -1,                          	NULL},
+	{"tc/brc_hash_keys",       	BPF_PROG_TYPE_SCHED_CLS,	0, BRC_PROG_XDP_HASH_KEYS,      	NULL},
+    {"xdp/brc_prepare_packet",  BPF_PROG_TYPE_XDP,      	0, BRC_PROG_XDP_PREPARE_PACKET, 	NULL},
+	{"xdp/brc_write_reply",     BPF_PROG_TYPE_XDP,      	0, BRC_PROG_XDP_WRITE_REPLY,    	NULL},
+	{"xdp/brc_maintain_tcp",    BPF_PROG_TYPE_XDP,      	0, BRC_PORG_XDP_MAINTAIN_TCP,   	NULL},
+    {"xdp/brc_invalidate_cache",BPF_PROG_TYPE_XDP,      	0, BRC_PROG_XDP_INVALIDATE_CACHE,	NULL},
+    {"tc/brc_tx_filter",       	BPF_PROG_TYPE_SCHED_CLS,	1, -1,                          	NULL},
+    {"tc/brc_update_cache",		BPF_PROG_TYPE_SCHED_CLS,	0, BRC_PROG_TC_UPDATE_CACHE,    	NULL},
 };
 
 static int cpu_nums = 0;
