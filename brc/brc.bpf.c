@@ -3,6 +3,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
+#include <bpf/bpf_endian.h>
 //#include "../libbpf/include/uapi/linux/pkt_cls.h"
 
 #include "bpf_helpers.h"
@@ -134,7 +135,7 @@ int brc_rx_filter_main(struct __sk_buff *skb) {
 	char *payload = transp + sizeof(*tcp);
 
 	// 经过上面的循环拿到目的端口和payload相关，payload是真实数据包的起始地址
-	if (dport == htons(6379) && payload+14 <= data_end) {
+	if (dport == bpf_htons(6379) && payload+14 <= data_end) {
 		// 目前只支持get
 		// "*2\r\n$3\r\nget\r\n$13\r\nusername:1234\r\n"
 		// 前八个字节亘古不变
@@ -257,8 +258,7 @@ int brc_hash_keys_main(struct __sk_buff *skb) {
 		// 用于debug
 		key_entry.key_data[pctx->value_size] = '\n';
 
-		// 栈上的变量直接塞进去可以？得测试一下
-		bpf_map_update_elem(&map_invaild_key, NULL, &key_entry ,BPF_ANY);
+		bpf_map_push_elem(&map_invaild_key, &key_entry, BPF_ANY);
 	}
 
 	struct brc_stats *stats = bpf_map_lookup_elem(&map_stats, &map_stats_index);
@@ -329,13 +329,13 @@ int brc_tx_filter_main(struct __sk_buff *skb) {
 	// redis这部分的解析逻辑在 processBulkItem,我们需要的就是string2ll
 	// 这个版本不能把尾调用和bpf to bpf结合使用就只能把解析也放在这个尾调用里面了
 	// "$6\r\nfoobar\r\n"
-	if (sport == htons(6379) && payload[0] == '$') {
+	if (sport == bpf_htons(6379) && payload[0] == '$') {
 		// step1:先解析出数字，然后向后推一个/r/n，然后再执行尾调用
 		struct parsing_context *pctx = bpf_map_lookup_elem(&map_parsing_context, &parsing_egress);
 		pctx->value_size = 0;
 		pctx->read_pkt_offset = 0;
 		if (!pctx) {
-			bpf_map_lookup_and_delete(&map_invaild_key, NULL, &key_entry);
+			bpf_map_pop_elem(&map_invaild_key, &key_entry);
 			return 0;
 		}
 		pctx->read_pkt_offset = 1;	// '$'
@@ -343,7 +343,7 @@ int brc_tx_filter_main(struct __sk_buff *skb) {
 		// "$-1\r\n"
 		// 一个get请求从客户端没读到自己希望的数据，那在全局cache中也需要一次delete操作 
 		if (payload[pctx->read_pkt_offset] == '-') {
-			bpf_map_lookup_and_delete(&map_invaild_key, NULL, &key_entry);
+			bpf_map_pop_elem(&map_invaild_key, &key_entry);
 			return 0;
 		}
 		// 那剩下的就是invaild的get操作，且确实从用户态获取到值了，这就需要尝试更新内核cache了
@@ -364,7 +364,7 @@ int brc_tx_filter_main(struct __sk_buff *skb) {
 		// step2:更新map_stats状态
 		struct brc_stats *stats = bpf_map_lookup_elem(&map_stats, &map_stats_index);
 		if (!stats) {
-			bpf_map_lookup_and_delete(&map_invaild_key, NULL, &key_entry);
+			bpf_map_pop_elem(&map_invaild_key, &key_entry);
 			return 0;
 		}
 		stats->try_update++;
@@ -394,7 +394,7 @@ int brc_update_cache_main(struct __sk_buff *skb) {
 	// ==========================================
 
 	// 获取此get返回值对应的key
-	bpf_map_lookup_and_delete(&map_invaild_key, NULL, &key_entry);
+	bpf_map_pop_elem(&map_invaild_key, &key_entry);
 	// compute the key hash
 #pragma clang loop unroll(disable)
 	// hash算法为FNV-1a 
