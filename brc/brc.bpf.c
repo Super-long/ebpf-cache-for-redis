@@ -369,61 +369,74 @@ int brc_tx_filter_main(struct __sk_buff *skb) {
 	}
 
 	void *data_end = (void *)(long)skb->data_end;
-	void *data     = (void *)(long)skb->data;
+	void *data = (void *)(long)skb->data;
 	struct ethhdr *eth = data;
-
 	struct iphdr *ip = data + sizeof(*eth);
-	// 协议不正确,且数据包封装出现问题，虽然基本不太可能，直接返回
-	if (ip->protocol != IPPROTO_TCP || ip + 1 > data_end) {
+	if (ip + 1 > data_end)
 		return 0;
-	}
+	void *transp = data + sizeof(*eth) + sizeof(*ip);
+	// 这里的解析应该是不规范的，参考ensure_header上面的链接
+	struct udphdr *udp;
+	struct tcphdr *tcp;
+	char *payload;
+	__be16 dport;
 
-	struct tcphdr *tcp = data + sizeof(*eth) + sizeof(*ip);
-	// TCP的包头可能不止20字节，但是tcphdr中看起来是定长的
-	char *payload = data + sizeof(*eth) + sizeof(*ip) + sizeof(*tcp);
 	int payload_size = skb->len - sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr);
 	struct redis_key key_entry;
 	unsigned int map_stats_index = MAP_STATS;
 	unsigned int parsing_egress = PARSING_EGRESS;
 
+	switch (ip->protocol) {
+		case IPPROTO_UDP:
+			return 0;
+			break;
+		case IPPROTO_TCP:
+			tcp = (struct tcphdr *) transp;
+			if (tcp + 1 > data_end)
+				return 0;
+			dport = tcp->source;
+			payload = transp + sizeof(*tcp);
+			break;
+		default:
+			return 0;
+	}
 
-	// 数据包太小，也直接返回
-	if (tcp + 1 > data_end)
-		return 0;
-
-	__be16 sport = tcp->source;
-
+	// 因为下面先用到了[0]，所以需要检查此下标(payload + 1 <= data_end )是否是有效的,这是必要的步骤
 	// 目前只处理批量回复，只监听6379，先支持set/get操作，后续再说
 	// redis这部分的解析逻辑在 processBulkItem,我们需要的就是string2ll
 	// 这个版本不能把尾调用和bpf to bpf结合使用就只能把解析也放在这个尾调用里面了
 	// "$6\r\nfoobar\r\n"
-	if (sport == bpf_htons(6379) && payload[0] == '$') {
+	if (dport == bpf_htons(6379) && payload + 1 <= data_end && payload[0] == '$') {
 		// step1:先解析出数字，然后向后推一个/r/n，然后再执行尾调用
 		struct parsing_context *pctx = bpf_map_lookup_elem(&map_parsing_context, &parsing_egress);
-		pctx->value_size = 0;
-		pctx->read_pkt_offset = 0;
 		if (!pctx) {
 			bpf_map_pop_elem(&map_invaild_key, &key_entry);
 			return 0;
 		}
+		pctx->value_size = 0;
 		pctx->read_pkt_offset = 1;	// '$'
 		
 		// "$-1\r\n"
 		// 一个get请求从客户端没读到自己希望的数据，那在全局cache中也需要一次delete操作 
-		if (payload[pctx->read_pkt_offset] == '-') {
+		if (payload+pctx->read_pkt_offset+1 <= data_end && payload[pctx->read_pkt_offset] == '-') {
 			bpf_map_pop_elem(&map_invaild_key, &key_entry);
 			return 0;
 		}
 		// 那剩下的就是invaild的get操作，且确实从用户态获取到值了，这就需要尝试更新内核cache了
 #pragma clang loop unroll(disable)
-		while (pctx->read_pkt_offset < payload_size && payload[pctx->read_pkt_offset] != '\r' && 
+		while (pctx->read_pkt_offset < BRC_MAX_CACHE_DATA_SIZE && payload+pctx->read_pkt_offset+1 <= data_end && payload[pctx->read_pkt_offset] != '\r' && 
 			payload[pctx->read_pkt_offset] >= '0' && payload[pctx->read_pkt_offset] <= '9') {
 			pctx->value_size *= 10;
 			pctx->value_size += payload[pctx->read_pkt_offset] - '0';
 			pctx->read_pkt_offset++;
 		}
 
-		if (pctx->read_pkt_offset < payload_size && pctx->read_pkt_offset + 1 < payload_size &&
+		if (payload+pctx->read_pkt_offset+1 > data_end || pctx->value_size > BRC_MAX_CACHE_DATA_SIZE) {
+			bpf_map_pop_elem(&map_invaild_key, &key_entry);
+			return 0;
+		}
+
+		if (payload+pctx->read_pkt_offset+2 <= data_end &&
 			payload[pctx->read_pkt_offset] == '\r' && payload[pctx->read_pkt_offset + 1] == '\n') {
 			pctx->read_pkt_offset+=2;
 		}
@@ -453,9 +466,24 @@ int brc_update_cache_main(struct __sk_buff *skb) {
 	unsigned int parsing_egress = PARSING_EGRESS;
 	struct redis_key key_entry;
 	struct parsing_context *pctx = bpf_map_lookup_elem(&map_parsing_context, &parsing_egress);
+	if (!pctx) {
+		bpf_map_pop_elem(&map_invaild_key, &key_entry);
+		return 0;
+	}
+	char *payload = (data + sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr));
 
-	char *payload = (data + sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr) + pctx->read_pkt_offset);
+	if (pctx->value_size > BRC_MAX_CACHE_DATA_SIZE || pctx->read_pkt_offset > BRC_MAX_PACKET_LENGTH) {
+		bpf_map_pop_elem(&map_invaild_key, &key_entry);
+		return 0;
+	}
 	u32 hash = FNV_OFFSET_BASIS_32;
+
+	if (payload + pctx->read_pkt_offset <= data_end) {
+		payload = payload + pctx->read_pkt_offset;
+	} else {
+		bpf_map_pop_elem(&map_invaild_key, &key_entry);
+		return 0;
+	}
 	// ==========================================
 	char fmt[] = "redis get reply(read_offset=%d, payload=%s, data=%s)\n";
 	bpf_trace_printk(fmt, sizeof(fmt), pctx->read_pkt_offset, payload, data);
@@ -463,6 +491,9 @@ int brc_update_cache_main(struct __sk_buff *skb) {
 
 	// 获取此get返回值对应的key
 	bpf_map_pop_elem(&map_invaild_key, &key_entry);
+	if (key_entry.len >= BRC_MAX_CACHE_DATA_SIZE) {
+		return 0;
+	}
 	// compute the key hash
 #pragma clang loop unroll(disable)
 	// hash算法为FNV-1a 

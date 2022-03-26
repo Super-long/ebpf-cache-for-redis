@@ -89,3 +89,8 @@ https://redis.io/topics/protocol
 指示编译器不允许展开循环，但是clang官网说展开的话可以增加ILP(指令级别并行)的机会 
 https://cseweb.ucsd.edu//classes/wi05/cse240a/ilp1.pdf
 https://clang.llvm.org/docs/LanguageExtensions.html#loop-unrolling
+
+# debug
+1. https://stackoverflow.com/questions/53136145/how-to-solve-the-r0-invalid-mem-access-inv-error-when-loading-an-ebpf-file-o
+2. https://mechpen.github.io/posts/2019-08-29-bpf-verifier/index.html
+3. 
