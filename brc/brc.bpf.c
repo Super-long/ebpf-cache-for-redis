@@ -499,33 +499,7 @@ int brc_update_cache_main(struct __sk_buff *skb) {
 	if (payload + pctx->read_pkt_offset <= data_end) {
 		payload = payload + pctx->read_pkt_offset;
 	}
-
-//=========
-	// void *data_end = (void *)(long)skb->data_end;
-	// void *data = (void *)(long)skb->data;
-	// unsigned int map_stats_index = MAP_STATS;
-	// unsigned int parsing_egress = PARSING_EGRESS;
-	// struct redis_key key_entry;
-	// struct parsing_context *pctx = bpf_map_lookup_elem(&map_parsing_context, &parsing_egress);
-	// if (!pctx) {
-	// 	bpf_map_pop_elem(&map_invaild_key, &key_entry);
-	// 	return 0;
-	// }
-	// char *payload = (data + sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr));
-
-	// if (pctx->value_size > BRC_MAX_CACHE_DATA_SIZE || pctx->read_pkt_offset > BRC_MAX_PACKET_LENGTH) {
-	// 	bpf_map_pop_elem(&map_invaild_key, &key_entry);
-	// 	return 0;
-	// }
-	// u32 hash = FNV_OFFSET_BASIS_32;
-
-	// if (payload + pctx->read_pkt_offset <= data_end) {
-	// 	payload = payload + pctx->read_pkt_offset;
-	// } else {
-	// 	bpf_map_pop_elem(&map_invaild_key, &key_entry);
-	// 	return 0;
-	// }
-	// ==========================================
+	
 	char fmt[] = "redis get reply(read_offset=%d, payload=%s, data=%s)\n";
 	bpf_trace_printk(fmt, sizeof(fmt), pctx->read_pkt_offset, payload, data);
 	// ==========================================

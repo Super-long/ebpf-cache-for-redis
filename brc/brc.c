@@ -109,7 +109,6 @@ int main(int argc, char **argv) {
     //======================填充progs数组====================================
     prog_count = sizeof(progs) / sizeof(progs[0]);
     for (int i = 0; i < prog_count; i++) {
-		printf("progs[i].name %s\n", progs[i].name);
 		progs[i].prog = bpf_object__find_program_by_title(skel->obj, progs[i].name);
 		if (!progs[i].prog) {
 			fprintf(stderr, "Error: bpf_object__find_program_by_title failed\n");
@@ -129,7 +128,6 @@ int main(int argc, char **argv) {
 
     //======================用于填充prog_map==============================
     for (int i = 0; i < prog_count; i++) {
-		printf("prog_count index[%d]\n", i);
         int prog_fd = bpf_program__fd(progs[i].prog);
 		if (prog_fd < 0) {
 			fprintf(stderr, "Error: Couldn't get file descriptor for program %s\n", progs[i].name);
@@ -137,7 +135,7 @@ int main(int argc, char **argv) {
 		}
         // -1指的是主程序
 		if (progs[i].map_prog_idx != -1) {
-			printf("tail call : %s\n", progs[i].name);
+			printf("tail call[%s]\n", progs[i].name);
             // 给 progs map 的 map_prog_idx 插入 prog_fd
 			err = bpf_map_update_elem(map_tc_progs_fd, &progs[i].map_prog_idx, &prog_fd, 0);
 			if (err) {
@@ -148,7 +146,7 @@ int main(int argc, char **argv) {
 			// TC相关,bpf_tc_attach的例子太少了,现在也没时间看libbpf的代码,所以pin下,命令行手动挂载
 			char pathname[PATH_MAX];
 			construct_mount_path(pathname, progs[i].name);
-			printf("main prog : %s\n", pathname);
+			printf("main prog[%s] mount path : %s\n", progs[i].name, pathname);
 retry:
 			if (bpf_program__pin(progs[i].prog, pathname)) {
 				fprintf(stderr, "Error: Failed to pin program '%s' to path %s\n", progs[i].name, pathname);
