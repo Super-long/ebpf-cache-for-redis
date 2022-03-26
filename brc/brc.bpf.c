@@ -91,7 +91,7 @@ struct {
 
 struct redis_key {
 	u32 hash;
-	char key_data[BRC_MAX_KEY_LENGTH];
+	char key_data[BRC_MAX_KEY_LENGTH + 1];
 	unsigned int len;
 };
 
@@ -99,7 +99,7 @@ struct redis_key {
 struct brc_cache_key {
 	struct bpf_spin_lock lock;
 	unsigned int len;
-	char key[BRC_MAX_KEY_LENGTH];	// 为了在hash相同的时候判断是否是同一个key
+	char key[BRC_MAX_KEY_LENGTH + 1];	// 为了在hash相同的时候判断是否是同一个key
 };
 
 struct parsing_context {
@@ -190,6 +190,7 @@ int brc_rx_filter_main(struct __sk_buff *skb) {
 
 			// "*2\r\n$3\r\nget\r\n$13\r\nusername:1234\r\n"
 			// 这里不加 pctx->read_pkt_offset < BRC_MAX_PACKET_LENGTH 就会载入失败
+			// ebpf如何处理无限循环？
 			if (pctx->read_pkt_offset < BRC_MAX_PACKET_LENGTH && payload+pctx->read_pkt_offset+1 <= data_end && payload[pctx->read_pkt_offset] == '$') {
 				pctx->read_pkt_offset++;	// 现在pctx->read_pkt_offset是数字的第一个字符的下标
 #pragma clang loop unroll(disable)
@@ -208,10 +209,10 @@ int brc_rx_filter_main(struct __sk_buff *skb) {
 				return 0;
 			}
 			// 目前value_size是key的大小,read_pkt_offset是key的第一个字节
-			bpf_tail_call(skb, &tc_progs, BRC_PROG_XDP_HASH_KEYS);
+			bpf_tail_call(skb, &tc_progs, BRC_PROG_TC_HASH_KEYS);
 		} else if (ip->protocol == IPPROTO_TCP) {
 			// 非get请求就会来这里,set会把标记设置为invaild
-			bpf_tail_call(skb, &tc_progs, BRC_PROG_XDP_INVALIDATE_CACHE);
+			bpf_tail_call(skb, &tc_progs, BRC_PROG_TC_INVALIDATE_CACHE);
 		}
 	}
 
@@ -225,13 +226,24 @@ int brc_rx_filter_main(struct __sk_buff *skb) {
 SEC("tc/brc_hash_keys")
 int brc_hash_keys_main(struct __sk_buff *skb) {
 	void *data_end = (void *)(long)skb->data_end;
-	void *data     = (void *)(long)skb->data;
+	void *data = (void *)(long)skb->data;
 	struct ethhdr *eth = data;
-
 	struct iphdr *ip = data + sizeof(*eth);
-	if (ip->protocol != IPPROTO_TCP || ip + 1 > data_end) {
+	void *transp = data + sizeof(*eth) + sizeof(*ip);
+	// 这里的解析应该是不规范的，参考ensure_header上面的链接
+	struct tcphdr *tcp;
+	char *payload;
+
+	// 这里必须要先验证ip + 1 > data_end，才能执行后面
+	if (ip + 1 > data_end || ip->protocol != IPPROTO_TCP)
 		return 0;
-	}
+
+	tcp = (struct tcphdr *) transp;
+	if (tcp + 1 > data_end)
+		return 0;
+	payload = transp + sizeof(*tcp);
+	int off;
+
 	unsigned int map_stats_index = MAP_STATS;
 	unsigned int parsing_egress = PARSING_INGRESS;
 	
@@ -239,16 +251,27 @@ int brc_hash_keys_main(struct __sk_buff *skb) {
 	if (!pctx) {
 		return 0;
 	}
-	struct tcphdr *tcp = data + sizeof(*eth) + sizeof(*ip);
-	char *payload = data + sizeof(*eth) + sizeof(*ip) + sizeof(*tcp) + pctx->read_pkt_offset;
 	
+	// pctx->read_pkt_offset > BRC_MAX_PACKET_LENGTH 非常重要，没这个load不了
+	if (pctx->value_size > BRC_MAX_KEY_LENGTH || pctx->read_pkt_offset > BRC_MAX_PACKET_LENGTH) {
+		return 1;
+	}
 	u32 hash = FNV_OFFSET_BASIS_32;
 	// 目前payload的第一个字节就是key实际值的第一个字节
 	// value_size是key的大小
+	// 循环中一定要显式的限定为有限循环,且需要给payload判断是否有效
+	if (payload + pctx->read_pkt_offset <= data_end) {
+		payload = payload + pctx->read_pkt_offset;
+	}
+
+	if (payload + 2 <= data_end && payload[0] == '\r' && payload[1] == '\n') {
 #pragma clang loop unroll(disable)
-	for (int i = 0; i < pctx->value_size; ++i) {
-		hash ^= payload[i];
-		hash *= FNV_PRIME_32;
+		for (off = 2; payload+off+1 <= data_end && off < pctx->value_size; ++off) {
+			hash ^= payload[off];
+			hash *= FNV_PRIME_32;
+		}
+	} else {
+		return 0;
 	}
 
 	u32 cache_idx = hash % BRC_CACHE_ENTRY_COUNT;
@@ -258,7 +281,6 @@ int brc_hash_keys_main(struct __sk_buff *skb) {
 	}
 	// 到了这里证明是个get操作，如果发现是invaild的，就把数据放入queue;如果是vaild的话就直接继续执行尾调用
 	bpf_spin_lock(&entry->lock);
-
 	// hash相同且字符串也一样证明找对了;vaild准备返回相关的事务;invaild pass 到用户态处理
 	if (entry->valid) {
 		// 这个标识代表在hash相同是判断key是否相同
@@ -266,29 +288,43 @@ int brc_hash_keys_main(struct __sk_buff *skb) {
 		if (pctx->value_size != entry->key_len) {
 			diff = false;
 		}
-		for (int i = 0; i < pctx->value_size && diff; ++i) {
-			if (payload[i] != entry->key[i]) {
-				diff = false;
-				break;
+// math between pkt pointer and register with unbounded min value is not allowed
+ 		if (diff) {
+#pragma clang loop unroll(disable)
+			for (off = 2; off < BRC_MAX_KEY_LENGTH && payload+off+1 <= data_end && off < pctx->value_size; ++off) {
+				if (payload[off] != entry->key[off - 2]) {
+					diff = false;
+					break;
+				}
 			}
 		}
-		if (entry->hash == hash && diff) {
-			bpf_spin_unlock(&entry->lock);
-			bpf_tail_call(skb, &tc_progs, BRC_PROG_XDP_PREPARE_PACKET);
+		u32 tmp_hash = entry->hash;
+		bpf_spin_unlock(&entry->lock);
+		if (tmp_hash == hash && diff) {
+			bpf_tail_call(skb, &tc_progs, BRC_PROG_TC_PREPARE_PACKET);
 		}
 		// 能到这里证明对应entry有效，但是于get中的key不匹配
 	} else {
 		// entry是无效的，pass到用户态处理
 		bpf_spin_unlock(&entry->lock);
+		// 这里是一个栈变量，限制了key的大小
 		struct redis_key key_entry = {
 			.hash = hash,
 			.len = pctx->value_size
 		};
-		for (int i = 0; i < pctx->value_size; ++i) {
-			key_entry.key_data[i] = payload[i];
+// 现在暂时不管这个循环
+// #pragma clang loop unroll(disable)
+		for (off = 2; off < BRC_MAX_KEY_LENGTH && payload+off+1 <= data_end && off < pctx->value_size; ++off) {
+			key_entry.key_data[off - 2] = payload[off];
 		}
+		if (off >= BRC_MAX_KEY_LENGTH || payload+off+1 > data_end) {
+			return 1;
+		}
+		// if (pctx->value_size >= BRC_MAX_KEY_LENGTH){
+		// 	return 1;
+		// }
 		// 用于debug
-		key_entry.key_data[pctx->value_size] = '\n';
+		//key_entry.key_data[pctx->value_size] = '\n';
 
 		bpf_map_push_elem(&map_invaild_key, &key_entry, BPF_ANY);
 	}

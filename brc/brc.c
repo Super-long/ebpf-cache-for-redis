@@ -29,11 +29,11 @@ struct bpf_progs_desc {
 
 static struct bpf_progs_desc progs[] = {
 	{"tc/brc_rx_filter",       	BPF_PROG_TYPE_SCHED_CLS, -1,                          	NULL},
-	{"tc/brc_hash_keys",       	BPF_PROG_TYPE_SCHED_CLS, BRC_PROG_XDP_HASH_KEYS,      	NULL},
-    {"tc/brc_prepare_packet",   BPF_PROG_TYPE_SCHED_CLS, BRC_PROG_XDP_PREPARE_PACKET, 	NULL},
-	{"tc/brc_write_reply",      BPF_PROG_TYPE_SCHED_CLS, BRC_PROG_XDP_WRITE_REPLY,    	NULL},
-	{"tc/brc_maintain_tcp",     BPF_PROG_TYPE_SCHED_CLS, BRC_PORG_XDP_MAINTAIN_TCP,   	NULL},
-    {"tc/brc_invalidate_cache", BPF_PROG_TYPE_SCHED_CLS, BRC_PROG_XDP_INVALIDATE_CACHE,	NULL},
+	{"tc/brc_hash_keys",       	BPF_PROG_TYPE_SCHED_CLS, BRC_PROG_TC_HASH_KEYS,      	NULL},
+    {"tc/brc_prepare_packet",   BPF_PROG_TYPE_SCHED_CLS, BRC_PROG_TC_PREPARE_PACKET, 	NULL},
+	{"tc/brc_write_reply",      BPF_PROG_TYPE_SCHED_CLS, BRC_PROG_TC_WRITE_REPLY,    	NULL},
+	{"tc/brc_maintain_tcp",     BPF_PROG_TYPE_SCHED_CLS, BRC_PORG_TC_MAINTAIN_TCP,   	NULL},
+    {"tc/brc_invalidate_cache", BPF_PROG_TYPE_SCHED_CLS, BRC_PROG_TC_INVALIDATE_CACHE,	NULL},
     {"tc/brc_tx_filter",       	BPF_PROG_TYPE_SCHED_CLS, -1,                          	NULL},
     {"tc/brc_update_cache",		BPF_PROG_TYPE_SCHED_CLS, BRC_PROG_TC_UPDATE_CACHE,    	NULL},
 };
