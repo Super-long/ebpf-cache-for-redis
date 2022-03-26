@@ -28,14 +28,14 @@ struct bpf_progs_desc {
 };
 
 static struct bpf_progs_desc progs[] = {
-	{"tc/brc_rx_filter",       	BPF_PROG_TYPE_SCHED_CLS,	1, -1,                          	NULL},
-	{"tc/brc_hash_keys",       	BPF_PROG_TYPE_SCHED_CLS,	0, BRC_PROG_XDP_HASH_KEYS,      	NULL},
-    {"xdp/brc_prepare_packet",  BPF_PROG_TYPE_XDP,      	0, BRC_PROG_XDP_PREPARE_PACKET, 	NULL},
-	{"xdp/brc_write_reply",     BPF_PROG_TYPE_XDP,      	0, BRC_PROG_XDP_WRITE_REPLY,    	NULL},
-	{"xdp/brc_maintain_tcp",    BPF_PROG_TYPE_XDP,      	0, BRC_PORG_XDP_MAINTAIN_TCP,   	NULL},
-    {"xdp/brc_invalidate_cache",BPF_PROG_TYPE_XDP,      	0, BRC_PROG_XDP_INVALIDATE_CACHE,	NULL},
-    {"tc/brc_tx_filter",       	BPF_PROG_TYPE_SCHED_CLS,	1, -1,                          	NULL},
-    {"tc/brc_update_cache",		BPF_PROG_TYPE_SCHED_CLS,	0, BRC_PROG_TC_UPDATE_CACHE,    	NULL},
+	{"tc/brc_rx_filter",       	BPF_PROG_TYPE_SCHED_CLS, -1,                          	NULL},
+	{"tc/brc_hash_keys",       	BPF_PROG_TYPE_SCHED_CLS, BRC_PROG_XDP_HASH_KEYS,      	NULL},
+    {"tc/brc_prepare_packet",   BPF_PROG_TYPE_SCHED_CLS, BRC_PROG_XDP_PREPARE_PACKET, 	NULL},
+	{"tc/brc_write_reply",      BPF_PROG_TYPE_SCHED_CLS, BRC_PROG_XDP_WRITE_REPLY,    	NULL},
+	{"tc/brc_maintain_tcp",     BPF_PROG_TYPE_SCHED_CLS, BRC_PORG_XDP_MAINTAIN_TCP,   	NULL},
+    {"tc/brc_invalidate_cache", BPF_PROG_TYPE_SCHED_CLS, BRC_PROG_XDP_INVALIDATE_CACHE,	NULL},
+    {"tc/brc_tx_filter",       	BPF_PROG_TYPE_SCHED_CLS, -1,                          	NULL},
+    {"tc/brc_update_cache",		BPF_PROG_TYPE_SCHED_CLS, BRC_PROG_TC_UPDATE_CACHE,    	NULL},
 };
 
 static int cpu_nums = 0;
@@ -75,11 +75,9 @@ int write_stat_line(FILE *fp, int map_fd) {
 int main(int argc, char **argv) {
     struct rlimit mem_limit = {RLIM_INFINITY, RLIM_INFINITY};
 	struct brc_bpf *skel;
-    int map_xdp_progs_fd, map_tc_progs_fd, prog_count, map_progs_fd, map_stats_fd;
-    int xdp_main_fd, tc_main_fd;
+    int map_tc_progs_fd, prog_count, map_progs_fd, map_stats_fd, tc_main_fd;
     // 目前写死，后续可以再修改
     int interface_idx;
-    __u32 xdp_flags = 0;
     int stats_poll_count = 5, stats_poll_interval = 5;
 	int err;
 
@@ -123,12 +121,6 @@ int main(int argc, char **argv) {
     //===================================================================
 
     //======================用于尾调用====================================
-    map_xdp_progs_fd = bpf_object__find_map_fd_by_name(skel->obj, "xdp_progs");
-	if (map_xdp_progs_fd < 0) {
-		fprintf(stderr, "Error: bpf_object__find_map_fd_by_name failed\n");
-		return 1;
-	}
-
 	map_tc_progs_fd = bpf_object__find_map_fd_by_name(skel->obj, "tc_progs");
 	if (map_tc_progs_fd < 0) {
 		fprintf(stderr, "Error: bpf_object__find_map_fd_by_name failed\n");
@@ -146,9 +138,6 @@ int main(int argc, char **argv) {
         // -1指的是主程序
 		if (progs[i].map_prog_idx != -1) {
             switch (progs[i].type) {
-            case BPF_PROG_TYPE_XDP:
-                map_progs_fd = map_xdp_progs_fd;
-                break;
             case BPF_PROG_TYPE_SCHED_CLS:
                 map_progs_fd = map_tc_progs_fd;
                 break;
@@ -162,7 +151,7 @@ int main(int argc, char **argv) {
 				fprintf(stderr, "Error: bpf_map_update_elem failed for prog array map\n");
 				return 1;
 			}
-		} else if (progs[i].pin) {
+		} else {
 			// TC相关,bpf_tc_attach的例子太少了,现在也没时间看libbpf的代码,所以pin下,命令行手动挂载
 			char pathname[PATH_MAX];
 			construct_mount_path(pathname, progs[i].name);
@@ -183,25 +172,6 @@ retry:
         }
     }
     //===========================================================================
-
-    //============================brc_rx_filter载入===============================
-    // ip link看下 暂时硬编码
-    interface_idx = 2;
-    xdp_main_fd = bpf_object__find_map_fd_by_name(skel->obj, "xdp/brc_rx_filter");
-	if (xdp_main_fd < 0) {
-		fprintf(stderr, "Error: bpf_object__find_map_fd_by_name failed\n");
-		return 1;
-	}
-
-    // 通用的挂载模式
-    xdp_flags |= XDP_FLAGS_DRV_MODE;
-    if (bpf_set_link_xdp_fd(interface_idx, xdp_main_fd, xdp_flags) < 0) {
-        fprintf(stderr, "Error: bpf_set_link_xdp_fd failed for interface %d\n", interface_idx);
-        return 1;
-    } else {
-        printf("Main BPF program attached to XDP on interface %d\n", interface_idx);
-    }
-    //============================================================================
 
     //============================brc_tx_filter载入================================
 	// https://elixir.bootlin.com/linux/latest/source/tools/testing/selftests/bpf/prog_tests/tc_bpf.c#L36

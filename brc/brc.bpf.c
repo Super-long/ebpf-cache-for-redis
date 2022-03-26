@@ -11,17 +11,31 @@
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
+#define tcp_hdrlen(tcp) (tcp->doff * 4)
+// https://zhangbinalan.gitbooks.io/protocol/content/ipxie_yi_tou_bu.html
+#define ipv4_hdrlen(ip) (ip->ihl * 4)
+
+// https://mechpen.github.io/posts/2019-08-29-bpf-verifier/index.html
+#define ensure_header(skb, var_off, const_off, hdr) do{	\
+	u32 len = const_off + sizeof(*hdr);			\
+	void *data = (void *)(long)skb->data + var_off;		\
+	void *data_end = (void *)(long)skb->data_end;		\
+								\
+	if (data + len > data_end)				\
+		bpf_skb_pull_data(skb, var_off + len);		\
+								\
+	data = (void *)(long)skb->data + var_off;		\
+	data_end = (void *)(long)skb->data_end;			\
+	if (data + len > data_end)				\
+		return 0;				\
+								\
+	hdr = (void *)(data + const_off);			\
+} while(0)
+
 /*
  * @brief: 用于尾调用
  * @notes: 尾调用上限目前为33
  **/ 
-struct {
-	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-	__uint(max_entries, RECURSION_UPPER_LIMIT);
-	__type(key, u32);
-	__type(value, u32);
-} xdp_progs SEC(".maps");
-
 struct {
 	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
 	__uint(max_entries, RECURSION_UPPER_LIMIT);
@@ -65,15 +79,15 @@ struct {
 	__type(key, unsigned int);
 	__type(value, struct parsing_context);
 	__uint(max_entries, PARSING_MAX);
-} map_parsing_context SEC(".maps") ;
+} map_parsing_context SEC(".maps");
 
 struct brc_cache_key;
 struct {
 	__uint(type, BPF_MAP_TYPE_QUEUE);
-	__type(key, 0);
+	//__type(key, 0); queue这里设置这个在load的时候会报错
 	__type(value, struct brc_cache_key);
 	__uint(max_entries, BRC_CACHE_QUEUE_SIZE);
-} map_invaild_key SEC(".maps") ;
+} map_invaild_key SEC(".maps");
 
 struct redis_key {
 	u32 hash;
@@ -121,26 +135,41 @@ int brc_rx_filter_main(struct __sk_buff *skb) {
 	void *data = (void *)(long)skb->data;
 	struct ethhdr *eth = data;
 	struct iphdr *ip = data + sizeof(*eth);
-	if (ip + 1 > data_end) {
-		return 0;
-	}
 	void *transp = data + sizeof(*eth) + sizeof(*ip);
-	struct tcphdr *tcp = (struct tcphdr *) transp;
-	if (tcp + 1 > data_end) {
-		return 0;
-	}
-	int payload_size = skb->len - (sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr));
+	// 这里的解析应该是不规范的，参考ensure_header上面的链接
+	struct udphdr *udp;
+	struct tcphdr *tcp;
+	char *payload;
 	__be16 dport;
-	dport = tcp->dest;
-	char *payload = transp + sizeof(*tcp);
 
-	// 经过上面的循环拿到目的端口和payload相关，payload是真实数据包的起始地址
+	if (ip + 1 > data_end)
+		return 0;
+
+	switch (ip->protocol) {
+		case IPPROTO_UDP:
+			udp = (struct udphdr *) transp;
+			if (udp + 1 > data_end)
+				return 0;
+			dport = udp->dest;
+			payload = transp + sizeof(*udp);
+			break;
+		case IPPROTO_TCP:
+			tcp = (struct tcphdr *) transp;
+			if (tcp + 1 > data_end)
+				return 0;
+			dport = tcp->dest;
+			payload = transp + sizeof(*tcp);
+			break;
+		default:
+			return 0;
+	}
+	// 经过上面的循环拿到目的端口和payload相关，payload是真实数据包的其实地址
 	if (dport == bpf_htons(6379) && payload+14 <= data_end) {
 		// 目前只支持get
 		// "*2\r\n$3\r\nget\r\n$13\r\nusername:1234\r\n"
 		// 前八个字节亘古不变
-		if (ip->protocol == IPPROTO_TCP && 
-			payload[9] == 'g' && payload[10] == 'e' && payload[11] == 't' && payload[12] == '\r' && payload[13] == '\n') { // is this a GET request
+		if (ip->protocol == IPPROTO_TCP && payload[9] == 'g' && payload[10] == 'e' && 
+			payload[11] == 't' && payload[12] == '\r' && payload[13] == '\n') { // is this a GET request
 			unsigned int map_stats_index = MAP_STATS;
 			unsigned int parsing_egress = PARSING_INGRESS;
 			// 如果一个目标端口的TCP包来了，而且是get请求，就会更新map_stats表中的数据
@@ -153,16 +182,18 @@ int brc_rx_filter_main(struct __sk_buff *skb) {
 			// 解析上下文
 			struct parsing_context *pctx = bpf_map_lookup_elem(&map_parsing_context, &parsing_egress);
 			if (!pctx) {
-				return XDP_PASS;
+				return 0;
 			}
 			// 14这个下标上应该是'$'
 			pctx->read_pkt_offset = 14;
 			pctx->value_size = 0;
 
 			// "*2\r\n$3\r\nget\r\n$13\r\nusername:1234\r\n"
-			if (payload[pctx->read_pkt_offset] == '$') {
+			// 这里不加 pctx->read_pkt_offset < BRC_MAX_PACKET_LENGTH 就会载入失败
+			if (pctx->read_pkt_offset < BRC_MAX_PACKET_LENGTH && payload+pctx->read_pkt_offset+1 <= data_end && payload[pctx->read_pkt_offset] == '$') {
 				pctx->read_pkt_offset++;	// 现在pctx->read_pkt_offset是数字的第一个字符的下标
-				while (pctx->read_pkt_offset < payload_size && payload[pctx->read_pkt_offset] != '\r' && 
+#pragma clang loop unroll(disable)
+				while (pctx->read_pkt_offset < BRC_MAX_PACKET_LENGTH && payload+pctx->read_pkt_offset+1 <= data_end && payload[pctx->read_pkt_offset] != '\r' && 
 					payload[pctx->read_pkt_offset] >= '0' && payload[pctx->read_pkt_offset] <= '9') {
 					pctx->value_size *= 10;
 					pctx->value_size += payload[pctx->read_pkt_offset] - '0';
@@ -172,7 +203,7 @@ int brc_rx_filter_main(struct __sk_buff *skb) {
 				return 0;
 			}
 
-			if (pctx->read_pkt_offset >= payload_size || pctx->value_size > BRC_MAX_KEY_LENGTH) {
+			if (payload+pctx->read_pkt_offset+1 > data_end || pctx->value_size > BRC_MAX_KEY_LENGTH) {
 				stats->big_key_pass_to_user++;
 				return 0;
 			}
@@ -183,6 +214,7 @@ int brc_rx_filter_main(struct __sk_buff *skb) {
 			bpf_tail_call(skb, &tc_progs, BRC_PROG_XDP_INVALIDATE_CACHE);
 		}
 	}
+
 	return 0;
 }
 
@@ -270,25 +302,25 @@ int brc_hash_keys_main(struct __sk_buff *skb) {
 	return 0;
 }
 
-SEC("xdp/brc_prepare_packet")
+SEC("tc/brc_prepare_packet")
 int brc_prepare_packet_main(struct xdp_md *ctx) {
 
 	return XDP_PASS;
 }
 
-SEC("xdp/brc_write_reply")
+SEC("tc/brc_write_reply")
 int brc_write_reply_main(struct xdp_md *ctx) {
 
 	return XDP_PASS;
 }
 
-SEC("xdp/brc_maintain_tcp")
+SEC("tc/brc_maintain_tcp")
 int brc_maintain_tcp_main(struct xdp_md *ctx) {
 
 	return XDP_PASS;
 }
 
-SEC("xdp/brc_invalidate_cache")
+SEC("tc/brc_invalidate_cache")
 int brc_invalidate_cache_main(struct xdp_md *ctx) {
 	return XDP_PASS;
 }
