@@ -460,30 +460,71 @@ int brc_tx_filter_main(struct __sk_buff *skb) {
 
 SEC("tc/brc_update_cache")
 int brc_update_cache_main(struct __sk_buff *skb) {
+	struct redis_key key_entry;
 	void *data_end = (void *)(long)skb->data_end;
 	void *data = (void *)(long)skb->data;
+	struct ethhdr *eth = data;
+	struct iphdr *ip = data + sizeof(*eth);
+	void *transp = data + sizeof(*eth) + sizeof(*ip);
+	// 这里的解析应该是不规范的，参考ensure_header上面的链接
+	struct tcphdr *tcp;
+	char *payload;
+
+	// 这里必须要先验证ip + 1 > data_end，才能执行后面
+	if (ip + 1 > data_end || ip->protocol != IPPROTO_TCP)
+		return 0;
+
+	tcp = (struct tcphdr *) transp;
+	if (tcp + 1 > data_end)
+		return 0;
+	payload = transp + sizeof(*tcp);
+	int off;
+
 	unsigned int map_stats_index = MAP_STATS;
 	unsigned int parsing_egress = PARSING_EGRESS;
-	struct redis_key key_entry;
+	
 	struct parsing_context *pctx = bpf_map_lookup_elem(&map_parsing_context, &parsing_egress);
 	if (!pctx) {
-		bpf_map_pop_elem(&map_invaild_key, &key_entry);
 		return 0;
 	}
-	char *payload = (data + sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr));
-
+	
+	// pctx->read_pkt_offset > BRC_MAX_PACKET_LENGTH 非常重要，没这个load不了
 	if (pctx->value_size > BRC_MAX_CACHE_DATA_SIZE || pctx->read_pkt_offset > BRC_MAX_PACKET_LENGTH) {
-		bpf_map_pop_elem(&map_invaild_key, &key_entry);
-		return 0;
+		return 1;
 	}
 	u32 hash = FNV_OFFSET_BASIS_32;
-
+	// 目前payload的第一个字节就是key实际值的第一个字节
+	// value_size是key的大小
+	// 循环中一定要显式的限定为有限循环,且需要给payload判断是否有效
 	if (payload + pctx->read_pkt_offset <= data_end) {
 		payload = payload + pctx->read_pkt_offset;
-	} else {
-		bpf_map_pop_elem(&map_invaild_key, &key_entry);
-		return 0;
 	}
+
+//=========
+	// void *data_end = (void *)(long)skb->data_end;
+	// void *data = (void *)(long)skb->data;
+	// unsigned int map_stats_index = MAP_STATS;
+	// unsigned int parsing_egress = PARSING_EGRESS;
+	// struct redis_key key_entry;
+	// struct parsing_context *pctx = bpf_map_lookup_elem(&map_parsing_context, &parsing_egress);
+	// if (!pctx) {
+	// 	bpf_map_pop_elem(&map_invaild_key, &key_entry);
+	// 	return 0;
+	// }
+	// char *payload = (data + sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr));
+
+	// if (pctx->value_size > BRC_MAX_CACHE_DATA_SIZE || pctx->read_pkt_offset > BRC_MAX_PACKET_LENGTH) {
+	// 	bpf_map_pop_elem(&map_invaild_key, &key_entry);
+	// 	return 0;
+	// }
+	// u32 hash = FNV_OFFSET_BASIS_32;
+
+	// if (payload + pctx->read_pkt_offset <= data_end) {
+	// 	payload = payload + pctx->read_pkt_offset;
+	// } else {
+	// 	bpf_map_pop_elem(&map_invaild_key, &key_entry);
+	// 	return 0;
+	// }
 	// ==========================================
 	char fmt[] = "redis get reply(read_offset=%d, payload=%s, data=%s)\n";
 	bpf_trace_printk(fmt, sizeof(fmt), pctx->read_pkt_offset, payload, data);
@@ -491,15 +532,13 @@ int brc_update_cache_main(struct __sk_buff *skb) {
 
 	// 获取此get返回值对应的key
 	bpf_map_pop_elem(&map_invaild_key, &key_entry);
-	if (key_entry.len >= BRC_MAX_CACHE_DATA_SIZE) {
-		return 0;
-	}
 	// compute the key hash
 #pragma clang loop unroll(disable)
 	// hash算法为FNV-1a 
 	// "$6\r\nfoobar\r\n"
 	// step1:找到此key对应的hash_index
-	for (unsigned int off = 0; off < key_entry.len; off++) {
+	// off < BRC_MAX_KEY_LENGTH 必须放在循环里，不能放在上面用key_entry.len和BRC_MAX_KEY_LENGTH做
+	for (unsigned int off = 0; off < BRC_MAX_KEY_LENGTH && off < key_entry.len ; off++) {
 		hash ^= key_entry.key_data[off];
 		hash *= FNV_PRIME_32;
 	}
@@ -538,12 +577,12 @@ int brc_update_cache_main(struct __sk_buff *skb) {
 		entry->hash = hash;
 
 		entry->key_len = key_entry.len;
-		for(int i = 0; i < key_entry.len; ++i) {
+		for(int i = 0; i < BRC_MAX_KEY_LENGTH && i < key_entry.len; ++i) {
 			entry->key[i] = key_entry.key_data[i];
 		}
 
 		entry->data_len = pctx->value_size;
-		for(int i = 0; i < pctx->value_size; ++i) {
+		for(int i = 0; payload+i+1 <= data_end && i < pctx->value_size && i < BRC_CACHE_ENTRY_COUNT; ++i) {
 			entry->data[i] = payload[i];
 		}
 
@@ -553,8 +592,9 @@ int brc_update_cache_main(struct __sk_buff *skb) {
 			return 0;
 		}
 		stats->update_count++;
+	} else {
+		bpf_spin_unlock(&entry->lock);
 	}
-
 
 	return 0;
 }

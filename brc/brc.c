@@ -22,7 +22,6 @@
 struct bpf_progs_desc {
 	char name[256];
 	enum bpf_prog_type type;
-    int pin;
 	int map_prog_idx;
 	struct bpf_program *prog;
 };
@@ -75,7 +74,7 @@ int write_stat_line(FILE *fp, int map_fd) {
 int main(int argc, char **argv) {
     struct rlimit mem_limit = {RLIM_INFINITY, RLIM_INFINITY};
 	struct brc_bpf *skel;
-    int map_tc_progs_fd, prog_count, map_progs_fd, map_stats_fd, tc_main_fd;
+    int map_tc_progs_fd, prog_count, map_stats_fd, tc_main_fd;
     // 目前写死，后续可以再修改
     int interface_idx;
     int stats_poll_count = 5, stats_poll_interval = 5;
@@ -130,6 +129,7 @@ int main(int argc, char **argv) {
 
     //======================用于填充prog_map==============================
     for (int i = 0; i < prog_count; i++) {
+		printf("prog_count index[%d]\n", i);
         int prog_fd = bpf_program__fd(progs[i].prog);
 		if (prog_fd < 0) {
 			fprintf(stderr, "Error: Couldn't get file descriptor for program %s\n", progs[i].name);
@@ -137,16 +137,9 @@ int main(int argc, char **argv) {
 		}
         // -1指的是主程序
 		if (progs[i].map_prog_idx != -1) {
-            switch (progs[i].type) {
-            case BPF_PROG_TYPE_SCHED_CLS:
-                map_progs_fd = map_tc_progs_fd;
-                break;
-            default:
-                fprintf(stderr, "Error: Program type doesn't correspond to any prog array map\n");
-                return 1;
-            }
+			printf("tail call : %s\n", progs[i].name);
             // 给 progs map 的 map_prog_idx 插入 prog_fd
-			err = bpf_map_update_elem(map_progs_fd, &progs[i].map_prog_idx, &prog_fd, 0);
+			err = bpf_map_update_elem(map_tc_progs_fd, &progs[i].map_prog_idx, &prog_fd, 0);
 			if (err) {
 				fprintf(stderr, "Error: bpf_map_update_elem failed for prog array map\n");
 				return 1;
@@ -155,6 +148,7 @@ int main(int argc, char **argv) {
 			// TC相关,bpf_tc_attach的例子太少了,现在也没时间看libbpf的代码,所以pin下,命令行手动挂载
 			char pathname[PATH_MAX];
 			construct_mount_path(pathname, progs[i].name);
+			printf("main prog : %s\n", pathname);
 retry:
 			if (bpf_program__pin(progs[i].prog, pathname)) {
 				fprintf(stderr, "Error: Failed to pin program '%s' to path %s\n", progs[i].name, pathname);
