@@ -106,3 +106,4 @@ https://clang.llvm.org/docs/LanguageExtensions.html#loop-unrolling
 2. https://mechpen.github.io/posts/2019-08-29-bpf-verifier/index.html
 3. 貌似bpf_printk的中文不能显示？
 4. spin_lock的范围内不允许使用bpf_printk
+5. 目前queue的push操作需要栈上的对象，导致key的上限比较小

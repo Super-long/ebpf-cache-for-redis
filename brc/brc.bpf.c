@@ -137,7 +137,6 @@ int brc_rx_filter_main(struct __sk_buff *skb) {
 	struct iphdr *ip = data + sizeof(*eth);
 	void *transp = data + sizeof(*eth) + sizeof(*ip);
 	// 这里的解析应该是不规范的，参考ensure_header上面的链接
-	struct udphdr *udp;
 	struct tcphdr *tcp;
 	char *payload;
 	__be16 dport;
@@ -148,7 +147,6 @@ int brc_rx_filter_main(struct __sk_buff *skb) {
 	switch (ip->protocol) {
 		case IPPROTO_UDP:
 			return 0;
-			break;
 		case IPPROTO_TCP:
 			tcp = (struct tcphdr *) transp;
 			if (tcp + 1 > data_end)
@@ -303,7 +301,6 @@ int brc_hash_keys_main(struct __sk_buff *skb) {
 		if (pctx->value_size != entry->key_len) {
 			diff = false;
 		}
-// math between pkt pointer and register with unbounded min value is not allowed
  		if (diff) {
 			for (off = 2; off < BRC_MAX_KEY_LENGTH && payload+off+1 <= data_end && off < pctx->value_size; ++off) {
 				if (payload[off] != entry->key[off - 2]) {
@@ -329,14 +326,15 @@ int brc_hash_keys_main(struct __sk_buff *skb) {
 			.hash = hash,
 			.len = pctx->value_size
 		};
-// #pragma clang loop unroll(disable)
+
 		for (off = 2; off < BRC_MAX_KEY_LENGTH && payload+off+1 <= data_end && off < pctx->value_size; ++off) {
 			key_entry.key_data[off - 2] = payload[off];
 		}
 		//bpf_printk("key_entry.key_data is [%s]\n", key_entry.key_data);
 		
 		if (off >= BRC_MAX_KEY_LENGTH || payload+off+1 > data_end) {
-			return 1;
+			bpf_printk("error : out of bounds\n");
+			return 0;
 		}
 		// if (pctx->value_size >= BRC_MAX_KEY_LENGTH){
 		// 	return 1;
@@ -352,7 +350,7 @@ int brc_hash_keys_main(struct __sk_buff *skb) {
 		return 0;
 	}
 	stats->miss_count++;
-
+	bpf_printk("get pass to user\n");
 	return 0;
 }
 
@@ -475,41 +473,40 @@ int brc_tx_filter_main(struct __sk_buff *skb) {
 	void *data = (void *)(long)skb->data;
 	struct ethhdr *eth = data;
 	struct iphdr *ip = data + sizeof(*eth);
-	if (ip + 1 > data_end)
-		return 0;
 	void *transp = data + sizeof(*eth) + sizeof(*ip);
 	// 这里的解析应该是不规范的，参考ensure_header上面的链接
-	struct udphdr *udp;
 	struct tcphdr *tcp;
 	char *payload;
-	__be16 dport;
-
-	int payload_size = skb->len - sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr);
+	__be16 sport;
 	struct redis_key key_entry;
 	unsigned int map_stats_index = MAP_STATS;
 	unsigned int parsing_egress = PARSING_EGRESS;
 
+	if (ip + 1 > data_end)
+		return 0;
+
 	switch (ip->protocol) {
 		case IPPROTO_UDP:
 			return 0;
-			break;
 		case IPPROTO_TCP:
 			tcp = (struct tcphdr *) transp;
 			if (tcp + 1 > data_end)
 				return 0;
-			dport = tcp->source;
+			sport = tcp->source;
 			payload = transp + sizeof(*tcp);
 			break;
 		default:
 			return 0;
 	}
+	if (sport == bpf_htons(6379))
+		bpf_printk("brc_tx_filter payload [%s]\n", payload);
 	
 	// 因为下面先用到了[0]，所以需要检查此下标(payload + 1 <= data_end )是否是有效的,这是必要的步骤
 	// 目前只处理批量回复，只监听6379，先支持set/get操作，后续再说
 	// redis这部分的解析逻辑在 processBulkItem,我们需要的就是string2ll
 	// 这个版本不能把尾调用和bpf to bpf结合使用就只能把解析也放在这个尾调用里面了
 	// "$6\r\nfoobar\r\n"
-	if (dport == bpf_htons(6379) && payload + 1 <= data_end && payload[0] == '$') {
+	if (sport == bpf_htons(6379) && payload + 1 <= data_end && payload[0] == '$') {
 		//bpf_printk("this is brc_tx_filter. payload is [%s]\n", payload);
 		bpf_printk("this is brc_tx_filter.\n");
 		// step1:先解析出数字，然后向后推一个/r/n，然后再执行尾调用
