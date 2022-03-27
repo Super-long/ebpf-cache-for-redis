@@ -93,7 +93,7 @@ int write_stats_to_file(char *filename, int map_fd) {
 
 	fprintf(fp, "STAT get_recv_count %u\n", aggregate_stats.get_recv_count);
 	fprintf(fp, "STAT set_recv_count %u\n", aggregate_stats.set_recv_count);
-	fprintf(fp, "STAT get_key_count %u\n", aggregate_stats.hit_misprediction);
+	fprintf(fp, "STAT hit_misprediction %u\n", aggregate_stats.hit_misprediction);
 	fprintf(fp, "STAT hit_count %u\n", aggregate_stats.hit_count);
 	fprintf(fp, "STAT miss_count %u\n", aggregate_stats.miss_count);
 	fprintf(fp, "STAT try_update %u\n", aggregate_stats.try_update);

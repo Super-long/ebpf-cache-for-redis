@@ -161,13 +161,13 @@ int brc_rx_filter_main(struct __sk_buff *skb) {
 	}
 
 	// 经过上面的循环拿到目的端口和payload相关，payload是真实数据包的其实地址
-	if (dport == bpf_htons(6379) && payload+14 <= data_end) {
+	if (dport == bpf_htons(6379) && payload+13 <= data_end) {
 		bpf_printk("recive request from port 6379 %s\n", payload);
 		// 目前只支持get
-		// "*2\r\n$3\r\nget\r\n$13\r\nusername:1234\r\n"
+		// "*2\r\n$3\r\nget\r\n$4\r\nkey1\r\n"
 		// 前八个字节亘古不变
-		if (payload[9] == 'g' && payload[10] == 'e' && 
-			payload[11] == 't' && payload[12] == '\r' && payload[13] == '\n') { // is this a GET request
+		if (payload[8] == 'g' && payload[9] == 'e' && 
+			payload[10] == 't' && payload[11] == '\r' && payload[12] == '\n') { // is this a GET request
 			bpf_printk("this is a get request\n");
 			unsigned int map_stats_index = MAP_STATS;
 			unsigned int parsing_egress = PARSING_INGRESS;
@@ -186,7 +186,7 @@ int brc_rx_filter_main(struct __sk_buff *skb) {
 				return 0;
 			}
 			// 14这个下标上应该是'$'
-			pctx->read_pkt_offset = 14;
+			pctx->read_pkt_offset = 13;
 			pctx->value_size = 0;
 
 			// "*2\r\n$3\r\nget\r\n$13\r\nusername:1234\r\n"
@@ -239,6 +239,7 @@ int brc_hash_keys_main(struct __sk_buff *skb) {
 	// 这里的解析应该是不规范的，参考ensure_header上面的链接
 	struct tcphdr *tcp;
 	char *payload;
+	bpf_printk("this is brc_hash_keys_main\n");
 
 	// 这里必须要先验证ip + 1 > data_end，才能执行后面
 	if (ip + 1 > data_end || ip->protocol != IPPROTO_TCP)
@@ -257,7 +258,9 @@ int brc_hash_keys_main(struct __sk_buff *skb) {
 	if (!pctx) {
 		return 0;
 	}
-	
+
+	// *3\r\n$3\r\nset\r\n$4\r\nkey1\r\n$6\r\nvalue1\r\n
+	bpf_printk("pctx->read_pkt_offset [%d], pctx->value_size [%d]\n", pctx->read_pkt_offset, pctx->value_size);
 	// pctx->read_pkt_offset > BRC_MAX_PACKET_LENGTH 非常重要，没这个load不了
 	if (pctx->value_size > BRC_MAX_KEY_LENGTH || pctx->read_pkt_offset > BRC_MAX_PACKET_LENGTH) {
 		return 1;
@@ -270,17 +273,23 @@ int brc_hash_keys_main(struct __sk_buff *skb) {
 		payload = payload + pctx->read_pkt_offset;
 	}
 
+	// 这个printf一加就load失败
+	//bpf_printk("this is brc_hash_keys, payload is %s\n", payload);
+	// "*2\r\n$3\r\nget\r\n$4\r\nkey1\r\n"
 	if (payload + 2 <= data_end && payload[0] == '\r' && payload[1] == '\n') {
 #pragma clang loop unroll(disable)
-		for (off = 2; payload+off+1 <= data_end && off < pctx->value_size; ++off) {
+		for (off = 2; payload+off+1 <= data_end && off < pctx->value_size+2; ++off) {
 			hash ^= payload[off];
 			hash *= FNV_PRIME_32;
 		}
 	} else {
+		bpf_printk("payload not begin 'CRLF'\n");
 		return 0;
 	}
 
 	u32 cache_idx = hash % BRC_CACHE_ENTRY_COUNT;
+	bpf_printk("brc_hash_keys: hash is [%d], cache_idx is[%d] \n", hash, cache_idx);
+
 	struct brc_cache_entry *entry = bpf_map_lookup_elem(&map_cache, &cache_idx);
 	if (!entry) {
 		return 0;
@@ -296,7 +305,6 @@ int brc_hash_keys_main(struct __sk_buff *skb) {
 		}
 // math between pkt pointer and register with unbounded min value is not allowed
  		if (diff) {
-#pragma clang loop unroll(disable)
 			for (off = 2; off < BRC_MAX_KEY_LENGTH && payload+off+1 <= data_end && off < pctx->value_size; ++off) {
 				if (payload[off] != entry->key[off - 2]) {
 					diff = false;
@@ -306,6 +314,8 @@ int brc_hash_keys_main(struct __sk_buff *skb) {
 		}
 		u32 tmp_hash = entry->hash;
 		bpf_spin_unlock(&entry->lock);
+		// spin_lock的范围内不允许使用bpf_printk
+		bpf_printk("this entry idx[%d] is vaild\n", cache_idx);
 		if (tmp_hash == hash && diff) {
 			bpf_tail_call(skb, &tc_progs, BRC_PROG_TC_PREPARE_PACKET);
 		}
@@ -313,6 +323,7 @@ int brc_hash_keys_main(struct __sk_buff *skb) {
 	} else {
 		// entry是无效的，pass到用户态处理
 		bpf_spin_unlock(&entry->lock);
+		bpf_printk("this entry idx[%d] is invaild\n", cache_idx);
 		// 这里是一个栈变量，限制了key的大小
 		struct redis_key key_entry = {
 			.hash = hash,
@@ -322,6 +333,8 @@ int brc_hash_keys_main(struct __sk_buff *skb) {
 		for (off = 2; off < BRC_MAX_KEY_LENGTH && payload+off+1 <= data_end && off < pctx->value_size; ++off) {
 			key_entry.key_data[off - 2] = payload[off];
 		}
+		//bpf_printk("key_entry.key_data is [%s]\n", key_entry.key_data);
+		
 		if (off >= BRC_MAX_KEY_LENGTH || payload+off+1 > data_end) {
 			return 1;
 		}
@@ -391,12 +404,12 @@ int brc_invalidate_cache_main(struct __sk_buff *skb) {
 	u32 hash;
 	int set_found = 0, interval = 0, key_found = 0;
 	// 下面是一个状态机
-	// *3\r\n$3\r\nset\r\n$4\r\nkey1\r\n$6\r\nvalue1\r\n
+	// *3\r\n$3\r\nset\r\n |(13) $4\r\nkey1\r\n$6\r\nvalue1\r\n
 	bpf_printk("come on! payload is %s\n", payload);
 	// if (payload + 11 <= data_end) {
 	// 	bpf_printk("[5]%c [8]%c [9]%c [10]%c\n",payload[5],payload[8], payload[9], payload[10]);
 	// }
-	for (unsigned int off = 8; off < BRC_MAX_PACKET_LENGTH && payload+off+1 <= data_end; off++) {
+	for (unsigned int off = 8; off < BRC_MAX_PACKET_LENGTH && payload+off+1 <= data_end;) {
 		if (set_found == 0 && payload+off+5 <= data_end && 
 			payload[off] == 's' && payload[off+1] == 'e' && payload[off+2] == 't') {
 			set_found = 1;
@@ -490,13 +503,15 @@ int brc_tx_filter_main(struct __sk_buff *skb) {
 		default:
 			return 0;
 	}
-
+	
 	// 因为下面先用到了[0]，所以需要检查此下标(payload + 1 <= data_end )是否是有效的,这是必要的步骤
 	// 目前只处理批量回复，只监听6379，先支持set/get操作，后续再说
 	// redis这部分的解析逻辑在 processBulkItem,我们需要的就是string2ll
 	// 这个版本不能把尾调用和bpf to bpf结合使用就只能把解析也放在这个尾调用里面了
 	// "$6\r\nfoobar\r\n"
 	if (dport == bpf_htons(6379) && payload + 1 <= data_end && payload[0] == '$') {
+		//bpf_printk("this is brc_tx_filter. payload is [%s]\n", payload);
+		bpf_printk("this is brc_tx_filter.\n");
 		// step1:先解析出数字，然后向后推一个/r/n，然后再执行尾调用
 		struct parsing_context *pctx = bpf_map_lookup_elem(&map_parsing_context, &parsing_egress);
 		if (!pctx) {
@@ -520,6 +535,8 @@ int brc_tx_filter_main(struct __sk_buff *skb) {
 			pctx->value_size += payload[pctx->read_pkt_offset] - '0';
 			pctx->read_pkt_offset++;
 		}
+
+		//bpf_printk("brc_tx_filter: pctx->value_size is [%d]\n", pctx->value_size);
 
 		if (payload+pctx->read_pkt_offset+1 > data_end || pctx->value_size > BRC_MAX_CACHE_DATA_SIZE) {
 			bpf_map_pop_elem(&map_invaild_key, &key_entry);
@@ -550,6 +567,7 @@ int brc_tx_filter_main(struct __sk_buff *skb) {
 
 SEC("tc/brc_update_cache")
 int brc_update_cache_main(struct __sk_buff *skb) {
+	bpf_printk("this is brc_update_cache_main\n");
 	struct redis_key key_entry;
 	void *data_end = (void *)(long)skb->data_end;
 	void *data = (void *)(long)skb->data;
@@ -589,9 +607,9 @@ int brc_update_cache_main(struct __sk_buff *skb) {
 	if (payload + pctx->read_pkt_offset <= data_end) {
 		payload = payload + pctx->read_pkt_offset;
 	}
-	
-	char fmt[] = "redis get reply(read_offset=%d, payload=%s, data=%s)\n";
-	bpf_trace_printk(fmt, sizeof(fmt), pctx->read_pkt_offset, payload, data);
+
+	bpf_printk("redis get reply(read_offset=%d)\n", pctx->read_pkt_offset);
+
 	// ==========================================
 
 	// 获取此get返回值对应的key
@@ -607,6 +625,8 @@ int brc_update_cache_main(struct __sk_buff *skb) {
 		hash *= FNV_PRIME_32;
 	}
 	u32 cache_idx = hash % BRC_CACHE_ENTRY_COUNT;
+
+	bpf_printk("hash is [%d], cache_idx is [%d]\n", hash, cache_idx);
 
 	struct brc_cache_entry *entry = bpf_map_lookup_elem(&map_cache, &cache_idx);
 	if (!entry) {
@@ -651,6 +671,9 @@ int brc_update_cache_main(struct __sk_buff *skb) {
 		}
 
 		bpf_spin_unlock(&entry->lock);
+		bpf_printk("brc_update_cache entry->key: %s, entry->key_len\n", entry->key, entry->key_len);
+		bpf_printk("brc_update_cache entry->data: %s, entry->data_len\n", entry->data, entry->data_len);
+		
 		struct brc_stats *stats = bpf_map_lookup_elem(&map_stats, &map_stats_index);
 		if (!stats) {
 			return 0;

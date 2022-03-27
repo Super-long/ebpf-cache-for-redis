@@ -4,6 +4,8 @@
 2. cd brc 
 3. make
 
+在brc/.bin 中执行`sh ../restart.sh`
+在任意路径执行`sh mount.sh`
 
 ---
 # 手动编译
@@ -103,3 +105,4 @@ https://clang.llvm.org/docs/LanguageExtensions.html#loop-unrolling
 1. https://stackoverflow.com/questions/53136145/how-to-solve-the-r0-invalid-mem-access-inv-error-when-loading-an-ebpf-file-o
 2. https://mechpen.github.io/posts/2019-08-29-bpf-verifier/index.html
 3. 貌似bpf_printk的中文不能显示？
+4. spin_lock的范围内不允许使用bpf_printk
