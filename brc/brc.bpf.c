@@ -147,11 +147,7 @@ int brc_rx_filter_main(struct __sk_buff *skb) {
 
 	switch (ip->protocol) {
 		case IPPROTO_UDP:
-			udp = (struct udphdr *) transp;
-			if (udp + 1 > data_end)
-				return 0;
-			dport = udp->dest;
-			payload = transp + sizeof(*udp);
+			return 0;
 			break;
 		case IPPROTO_TCP:
 			tcp = (struct tcphdr *) transp;
@@ -163,18 +159,22 @@ int brc_rx_filter_main(struct __sk_buff *skb) {
 		default:
 			return 0;
 	}
+
 	// 经过上面的循环拿到目的端口和payload相关，payload是真实数据包的其实地址
 	if (dport == bpf_htons(6379) && payload+14 <= data_end) {
+		bpf_printk("recive request from port 6379 %s\n", payload);
 		// 目前只支持get
 		// "*2\r\n$3\r\nget\r\n$13\r\nusername:1234\r\n"
 		// 前八个字节亘古不变
-		if (ip->protocol == IPPROTO_TCP && payload[9] == 'g' && payload[10] == 'e' && 
+		if (payload[9] == 'g' && payload[10] == 'e' && 
 			payload[11] == 't' && payload[12] == '\r' && payload[13] == '\n') { // is this a GET request
+			bpf_printk("this is a get request\n");
 			unsigned int map_stats_index = MAP_STATS;
 			unsigned int parsing_egress = PARSING_INGRESS;
 			// 如果一个目标端口的TCP包来了，而且是get请求，就会更新map_stats表中的数据
 			struct brc_stats *stats = bpf_map_lookup_elem(&map_stats, &map_stats_index);
 			if (!stats) {
+				bpf_printk("stats invaild\n");
 				return 0;
 			}
 			stats->get_recv_count++;
@@ -182,6 +182,7 @@ int brc_rx_filter_main(struct __sk_buff *skb) {
 			// 解析上下文
 			struct parsing_context *pctx = bpf_map_lookup_elem(&map_parsing_context, &parsing_egress);
 			if (!pctx) {
+				bpf_printk("pctx invaild\n");
 				return 0;
 			}
 			// 14这个下标上应该是'$'
@@ -201,16 +202,21 @@ int brc_rx_filter_main(struct __sk_buff *skb) {
 					pctx->read_pkt_offset++;
 				}
 			} else {
+				bpf_printk("common check\n");
 				return 0;
 			}
 
 			if (payload+pctx->read_pkt_offset+1 > data_end || pctx->value_size > BRC_MAX_KEY_LENGTH) {
 				stats->big_key_pass_to_user++;
+				bpf_printk("out of bounds\n");
 				return 0;
 			}
+			bpf_printk("value size is %d\n", pctx->value_size);
 			// 目前value_size是key的大小,read_pkt_offset是key的第一个字节
 			bpf_tail_call(skb, &tc_progs, BRC_PROG_TC_HASH_KEYS);
-		} else if (ip->protocol == IPPROTO_TCP) {
+		} else {
+			// *3\r\n$3\r\nset\r\n$4\r\nkey1\r\n$6\r\nvalue1\r\n
+			bpf_printk("this is a set request\n");
 			// 非get请求就会来这里,set会把标记设置为invaild
 			bpf_tail_call(skb, &tc_progs, BRC_PROG_TC_INVALIDATE_CACHE);
 		}
@@ -312,7 +318,6 @@ int brc_hash_keys_main(struct __sk_buff *skb) {
 			.hash = hash,
 			.len = pctx->value_size
 		};
-// 现在暂时不管这个循环
 // #pragma clang loop unroll(disable)
 		for (off = 2; off < BRC_MAX_KEY_LENGTH && payload+off+1 <= data_end && off < pctx->value_size; ++off) {
 			key_entry.key_data[off - 2] = payload[off];
@@ -339,26 +344,111 @@ int brc_hash_keys_main(struct __sk_buff *skb) {
 }
 
 SEC("tc/brc_prepare_packet")
-int brc_prepare_packet_main(struct xdp_md *ctx) {
+int brc_prepare_packet_main(struct __sk_buff *skb) {
 
 	return XDP_PASS;
 }
 
 SEC("tc/brc_write_reply")
-int brc_write_reply_main(struct xdp_md *ctx) {
+int brc_write_reply_main(struct __sk_buff *skb) {
 
 	return XDP_PASS;
 }
 
 SEC("tc/brc_maintain_tcp")
-int brc_maintain_tcp_main(struct xdp_md *ctx) {
+int brc_maintain_tcp_main(struct __sk_buff *skb) {
 
 	return XDP_PASS;
 }
 
+// 只做一件事，就是在get的时候让这个hash index上的entry invaild
 SEC("tc/brc_invalidate_cache")
-int brc_invalidate_cache_main(struct xdp_md *ctx) {
-	return XDP_PASS;
+int brc_invalidate_cache_main(struct __sk_buff *skb) {
+	void *data_end = (void *)(long)skb->data_end;
+	void *data = (void *)(long)skb->data;
+	struct ethhdr *eth = data;
+	struct iphdr *ip = data + sizeof(*eth);
+	void *transp = data + sizeof(*eth) + sizeof(*ip);
+	// 这里的解析应该是不规范的，参考ensure_header上面的链接
+	struct tcphdr *tcp;
+	char *payload;
+
+	// 这里必须要先验证ip + 1 > data_end，才能执行后面
+	if (ip + 1 > data_end || ip->protocol != IPPROTO_TCP)
+		return 0;
+
+	tcp = (struct tcphdr *) transp;
+	if (tcp + 1 > data_end)
+		return 0;
+	payload = transp + sizeof(*tcp);
+
+	unsigned int map_stats_index = MAP_STATS;
+	struct brc_stats *stats = bpf_map_lookup_elem(&map_stats, &map_stats_index);
+	if (!stats) {
+		return 0;
+	}
+
+	u32 hash;
+	int set_found = 0, interval = 0, key_found = 0;
+	// 下面是一个状态机
+	// *3\r\n$3\r\nset\r\n$4\r\nkey1\r\n$6\r\nvalue1\r\n
+	bpf_printk("come on! payload is %s\n", payload);
+	// if (payload + 11 <= data_end) {
+	// 	bpf_printk("[5]%c [8]%c [9]%c [10]%c\n",payload[5],payload[8], payload[9], payload[10]);
+	// }
+	for (unsigned int off = 8; off < BRC_MAX_PACKET_LENGTH && payload+off+1 <= data_end; off++) {
+		if (set_found == 0 && payload+off+5 <= data_end && 
+			payload[off] == 's' && payload[off+1] == 'e' && payload[off+2] == 't') {
+			set_found = 1;
+			bpf_printk("find set!!!\n");
+			// 把off移动搭配key的长度字段的第一个字符,除了set还跳过了’\r\n‘
+			off += 5;
+			stats->set_recv_count++;
+		}	// 这里的+4指“$5\r\n”,目前暂且不解析长度，直接认为是一位数，并使用'/r'判断结尾
+		else if (interval == 0 && set_found == 1 && payload+off+4 <= data_end && payload[off] == '$' 
+			&& payload[off+2] == '\r' && payload[off+3] == '\n') {
+			bpf_printk("find interval!!!\n");
+			interval = 1;
+			// 把off移动搭配key的长度字段的第一个字符
+			off += 4;
+		}
+		else if (key_found == 0 && interval == 1 && payload+off+1 <= data_end && payload[off] != '\r') {
+			bpf_printk("find key start!!!\n");
+			hash = FNV_OFFSET_BASIS_32;
+			hash ^= payload[off];
+			hash *= FNV_PRIME_32;
+			key_found = 1;
+			off += 1;
+		}	// 目前解析也不用长度，直接用'\n'判断
+		else if (key_found == 1 && payload+off+1 <= data_end ) {
+			if (payload[off] == '\r') { // 找到key的末尾了
+				u32 cache_idx = hash % BRC_CACHE_ENTRY_COUNT;
+				bpf_printk("find key end!!! hash[%d] cache_idx[%d]\n", hash, cache_idx);
+				struct brc_cache_entry *entry = bpf_map_lookup_elem(&map_cache, &cache_idx);
+				if (!entry) {
+					bpf_printk("entry invaild when key hash end\n");
+					return 0;
+				}
+				bpf_spin_lock(&entry->lock);
+				if (entry->valid) {
+					stats->invalidation_count++;
+				}
+				entry->valid = 0;
+				bpf_spin_unlock(&entry->lock);
+				break;
+			}
+			else { // still processing the key
+				hash ^= payload[off];
+				hash *= FNV_PRIME_32;
+				off += 1;
+			}
+		} else {
+			// 这个条件必须得有,要么就load不进去
+			break;
+		}
+	}
+	bpf_printk("brc_invalidate_cache finish!!!\n");
+	return 0;
 }
 
 SEC("tc/brc_tx_filter")

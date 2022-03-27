@@ -15,18 +15,24 @@
 
 # 执行
 现在在用户态挂载的时候有一个大问题，就是bpf_tc_hook_create不太成熟，资料较少，所以使用object pin先把TC bpf挂载，然后再手动挂载TC程序,我倾向于使用更低级别的接口,但是捣鼓了两天没搞出来,后续看下libbpf源码
-1. cd .bin
-2. ./brc
-3. tc qdisc add dev eth0 clsact 
+1. make && cd .bin && ./brc
+2. tc qdisc add dev eth0 clsact 
+3. tc filter add dev eth0 ingress bpf object-pinned /sys/fs/bpf/tc/brc_rx_filter
 4. tc filter add dev eth0 egress bpf object-pinned /sys/fs/bpf/tc/brc_tx_filter
 5. cat /sys/kernel/debug/tracing/trace_pipe
 
+上述三四步不能颠倒，否则map_keys中的数据可能会出现错乱
+
+如果bpf文件系统还没挂载就执行：
+1. mount -t bpf none /sys/fs/bpf/
+
 # 卸载
 卸载bpf程序和qdisc
-1. tc filter del dev eth0 egress 
-2. tc qdisc del dev eth0 clsact
-3. rm /sys/fs/bpf/tc/brc_rx_filter
-4. rm /sys/fs/bpf/tc/brc_tx_filter
+1. tc filter del dev eth0 egress
+2. tc filter del dev eth0 ingress
+3. tc qdisc del dev eth0 clsact
+4. rm /sys/fs/bpf/tc/brc_rx_filter
+5. rm /sys/fs/bpf/tc/brc_tx_filter
 
 # 对于BPF程序的解释
 ## brc_rx_filter
@@ -37,6 +43,8 @@
 1. 找到这个get请求中key的hash_index
 2. 对应的entry如果是有效的话调用brc_prepare_packet
 3. 对应的entry是无效的话把key放入到invaild_key_data中，在egress中需要用到这个key的数据(queue如何把栈上数据放入其中)
+## brc_invalidate_cache
+1. 使得set操作中key对应的hash entry为invaild
 ## brc_tx_filter
 1. 对于6379端口且是批量回复的数据执行解析，解析结果放在pctx中，如果发现是"$-1\r\n"的话需要从invaild_key_data中pop一个数据项，然后执行brc_update_cache
 ## brc_update_cache
@@ -94,4 +102,4 @@ https://clang.llvm.org/docs/LanguageExtensions.html#loop-unrolling
 # debug
 1. https://stackoverflow.com/questions/53136145/how-to-solve-the-r0-invalid-mem-access-inv-error-when-loading-an-ebpf-file-o
 2. https://mechpen.github.io/posts/2019-08-29-bpf-verifier/index.html
-3. 
+3. 貌似bpf_printk的中文不能显示？
