@@ -25,7 +25,8 @@
 卸载bpf程序和qdisc
 1. tc filter del dev eth0 egress 
 2. tc qdisc del dev eth0 clsact
-3. rm /sys/fs/bpf/tc/brc_tx_filter
+3. rm /sys/fs/bpf/tc/brc_rx_filter
+4. rm /sys/fs/bpf/tc/brc_tx_filter
 
 # 对于BPF程序的解释
 ## brc_rx_filter

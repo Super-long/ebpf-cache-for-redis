@@ -64,11 +64,74 @@ void construct_mount_path(char* pathame, char* prog_name) {
 }
 
 int write_stats_to_file(char *filename, int map_fd) {
-	printf("lizhoalong\n");
+	// map类型是BPF_MAP_TYPE_PERCPU_ARRAY，所以取数据的array应该是定长的
+	struct brc_stats stats[cpu_nums];
+	struct brc_stats aggregate_stats;
+	__u32 key = 0;
+	FILE *fp;
+
+	memset(&aggregate_stats, 0, sizeof(struct brc_stats));
+
+	assert(bpf_map_lookup_elem(map_fd, &key, stats) == 0);
+	for (int i = 0; i < cpu_nums; i++) {
+		aggregate_stats.get_recv_count += stats[i].get_recv_count;
+		aggregate_stats.set_recv_count += stats[i].set_recv_count;
+		aggregate_stats.hit_misprediction += stats[i].hit_misprediction;
+		aggregate_stats.hit_count += stats[i].hit_count;
+		aggregate_stats.miss_count += stats[i].miss_count;
+		aggregate_stats.try_update += stats[i].try_update;
+		aggregate_stats.update_count += stats[i].update_count;
+		aggregate_stats.invalidation_count += stats[i].invalidation_count;
+		aggregate_stats.big_key_pass_to_user += stats[i].big_key_pass_to_user;
+	}
+	// 追加写入
+	fp = fopen(STATS_PATH, "w+");
+	if (fp == NULL) {
+		fprintf(stderr, "Error: failed to write stats to file '%s'\n", filename);
+		return -1;
+	}
+
+	fprintf(fp, "STAT get_recv_count %u\n", aggregate_stats.get_recv_count);
+	fprintf(fp, "STAT set_recv_count %u\n", aggregate_stats.set_recv_count);
+	fprintf(fp, "STAT get_key_count %u\n", aggregate_stats.hit_misprediction);
+	fprintf(fp, "STAT hit_count %u\n", aggregate_stats.hit_count);
+	fprintf(fp, "STAT miss_count %u\n", aggregate_stats.miss_count);
+	fprintf(fp, "STAT try_update %u\n", aggregate_stats.try_update);
+	fprintf(fp, "STAT update_count %u\n", aggregate_stats.update_count);
+	fprintf(fp, "STAT invalidation_count %u\n", aggregate_stats.invalidation_count);
+	fprintf(fp, "STAT big_key_pass_to_user %u\n", aggregate_stats.big_key_pass_to_user);
+
+	fclose(fp);
+	return 0;
 }
 
 int write_stat_line(FILE *fp, int map_fd) {
-	printf("yunwenqi\n");
+	struct brc_stats stats[cpu_nums];
+	struct brc_stats aggregate_stats;
+	__u32 key = 0;
+
+	memset(&aggregate_stats, 0, sizeof(struct brc_stats));
+
+	assert(bpf_map_lookup_elem(map_fd, &key, stats) == 0);
+
+	for (int i = 0; i < cpu_nums; i++) {
+		aggregate_stats.get_recv_count += stats[i].get_recv_count;
+		aggregate_stats.set_recv_count += stats[i].set_recv_count;
+		aggregate_stats.hit_misprediction += stats[i].hit_misprediction;
+		aggregate_stats.hit_count += stats[i].hit_count;
+		aggregate_stats.miss_count += stats[i].miss_count;
+		aggregate_stats.try_update += stats[i].try_update;
+		aggregate_stats.update_count += stats[i].update_count;
+		aggregate_stats.invalidation_count += stats[i].invalidation_count;
+		aggregate_stats.big_key_pass_to_user += stats[i].big_key_pass_to_user;
+	}
+
+	fprintf(fp, "%lu,%u,%u,%u,%u,%u,%u,%u,%u,%u\n", (unsigned long)time(NULL), aggregate_stats.get_recv_count,
+		aggregate_stats.set_recv_count, aggregate_stats.hit_misprediction,
+		aggregate_stats.hit_count, aggregate_stats.miss_count, aggregate_stats.try_update, 
+		aggregate_stats.update_count, aggregate_stats.invalidation_count, aggregate_stats.big_key_pass_to_user);
+
+	return 0;
 }
 
 int main(int argc, char **argv) {
@@ -196,7 +259,6 @@ retry:
     //===================================================================
 
     //============================注册对应的信号处理函数================================
-
     cpu_nums = libbpf_num_possible_cpus();
 
 	map_stats_fd = bpf_object__find_map_fd_by_name(skel->obj, "map_stats");
