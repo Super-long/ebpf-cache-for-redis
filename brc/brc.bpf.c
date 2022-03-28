@@ -381,6 +381,7 @@ int brc_invalidate_cache_main(struct __sk_buff *skb) {
 	// 这里的解析应该是不规范的，参考ensure_header上面的链接
 	struct tcphdr *tcp;
 	char *payload;
+	int key_size = 0;
 
 	// 这里必须要先验证ip + 1 > data_end，才能执行后面
 	if (ip + 1 > data_end || ip->protocol != IPPROTO_TCP)
@@ -398,29 +399,36 @@ int brc_invalidate_cache_main(struct __sk_buff *skb) {
 	}
 
 	u32 hash;
-	int set_found = 0, interval = 0, key_found = 0;
+	int set_found = 0, interval = 0, key_found = 0, key_index = 0;
 	// 下面是一个状态机
 	// *3\r\n$3\r\nset\r\n |(13) $4\r\nkey1\r\n$6\r\nvalue1\r\n
 	bpf_printk("come on! payload is %s\n", payload);
-	// if (payload + 11 <= data_end) {
-	// 	bpf_printk("[5]%c [8]%c [9]%c [10]%c\n",payload[5],payload[8], payload[9], payload[10]);
-	// }
 	for (unsigned int off = 8; off < BRC_MAX_PACKET_LENGTH && payload+off+1 <= data_end;) {
 		if (set_found == 0 && payload+off+5 <= data_end && 
 			payload[off] == 's' && payload[off+1] == 'e' && payload[off+2] == 't') {
 			set_found = 1;
-			bpf_printk("find set!!!\n");
+			//bpf_printk("find set!!!\n");
 			// 把off移动搭配key的长度字段的第一个字符,除了set还跳过了’\r\n‘
 			off += 5;
 			stats->set_recv_count++;
-		}	// 这里的+4指“$5\r\n”,目前暂且不解析长度，直接认为是一位数，并使用'/r'判断结尾
-		else if (interval == 0 && set_found == 1 && payload+off+4 <= data_end && payload[off] == '$' 
-			&& payload[off+2] == '\r' && payload[off+3] == '\n') {
-			bpf_printk("find interval!!!\n");
-			interval = 1;
-			// 把off移动搭配key的长度字段的第一个字符
-			off += 4;
 		}
+		else if (interval == 0 && set_found == 1 && payload+off+1 <= data_end && payload[off] == '$') {
+			off++;
+			while (off < BRC_MAX_CACHE_DATA_SIZE && payload+off+1 <= data_end &&
+				payload[off] != '\r' && payload[off] >= '0' && payload[off] <= '9') {
+				key_size *= 10;
+				key_size += payload[off] - '0';
+				off++;
+			}
+			if (payload+off+2 <= data_end && payload[off] == '\r' && payload[off+1] == '\n') {
+				off += 2;
+			} else {
+				bpf_printk("may be redis error2.\n");
+				return 0;
+			}
+			//bpf_printk("find interval!!!\n");
+			interval = 1;
+		}	// 在key解析开始时做一些前置准备
 		else if (key_found == 0 && interval == 1 && payload+off+1 <= data_end && payload[off] != '\r') {
 			bpf_printk("find key start!!!\n");
 			hash = FNV_OFFSET_BASIS_32;
@@ -456,6 +464,8 @@ int brc_invalidate_cache_main(struct __sk_buff *skb) {
 			break;
 		}
 	}
+	// 为了看下interval解析到对不对，但是放在那个循环里就会load失败
+	bpf_printk("key_size is [%d]\n", key_size);
 	bpf_printk("brc_invalidate_cache finish!!!\n");
 	return 0;
 }
