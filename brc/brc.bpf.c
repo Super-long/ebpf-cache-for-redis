@@ -464,11 +464,6 @@ int brc_invalidate_cache_main(struct __sk_buff *skb) {
 
 SEC("tc/brc_tx_filter")
 int brc_tx_filter_main(struct __sk_buff *skb) {
-	// 大于cache中允许的最大长度，直接返回错误
-	if (skb->len > BRC_MAX_CACHE_DATA_SIZE + sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr)) {
-		return 0;
-	}
-
 	void *data_end = (void *)(long)skb->data_end;
 	void *data = (void *)(long)skb->data;
 	struct ethhdr *eth = data;
@@ -498,14 +493,31 @@ int brc_tx_filter_main(struct __sk_buff *skb) {
 		default:
 			return 0;
 	}
-	if (sport == bpf_htons(6379))
-		bpf_printk("brc_tx_filter payload [%s]\n", payload);
+
+
+	if (sport == bpf_htons(6379)) {
+		int tcp_len = tcp_hdrlen(tcp);
+		int ip_len = ipv4_hdrlen(ip);
+		bpf_printk("data_end - data -> [%d]\n", data_end - data);
+		bpf_printk("brc_tx_filter payload [%s] skb->len[%d]\n", payload, skb->len);
+		bpf_printk("brc_tx_filter tcp->len[%d] ip->len[%d]\n", tcp_len, tcp_len);
+		if (payload + 3 <= data_end) {
+			bpf_printk("payload: [%c] [%c] [%c] \n", 
+				payload[0], payload[1], payload[2]);
+		} else {
+			bpf_printk("gg\n");
+		}
+	}
+
+	if (payload+2 <= data_end && payload[0] == '$' && payload[1] == '6') {
+		bpf_printk("brc_tx_filter payload [%s] sport[%d]\n", payload, sport);
+	}
 	
 	// 因为下面先用到了[0]，所以需要检查此下标(payload + 1 <= data_end )是否是有效的,这是必要的步骤
 	// 目前只处理批量回复，只监听6379，先支持set/get操作，后续再说
 	// redis这部分的解析逻辑在 processBulkItem,我们需要的就是string2ll
 	// 这个版本不能把尾调用和bpf to bpf结合使用就只能把解析也放在这个尾调用里面了
-	// "$6\r\nfoobar\r\n"
+	// "$6\r\nvalue1\r\n"
 	if (sport == bpf_htons(6379) && payload + 1 <= data_end && payload[0] == '$') {
 		//bpf_printk("this is brc_tx_filter. payload is [%s]\n", payload);
 		bpf_printk("this is brc_tx_filter.\n");
