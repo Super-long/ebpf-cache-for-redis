@@ -105,6 +105,7 @@ struct brc_cache_key {
 struct parsing_context {
 	unsigned int value_size;	// 在brc_rx_filter也可以代表key的大小
 	unsigned short read_pkt_offset;
+	int hash;					// 存储解析过程中的hash，方便后续直接拿到对应的value值
 };
 
 struct brc_cache_entry {
@@ -308,10 +309,15 @@ int brc_hash_keys_main(struct __sk_buff *skb) {
 			}
 		}
 		u32 tmp_hash = entry->hash;
+		int vaild = entry->valid;
+		// 为了在brc_prepare_packet中拿到对应的data
 		bpf_spin_unlock(&entry->lock);
 		// spin_lock的范围内不允许使用bpf_printk
 		bpf_printk("this entry idx[%d] is vaild\n", cache_idx);
-		if (tmp_hash == hash && diff) {
+		// hash值相同且逐字节比较相同，此时开始准备返回数据包
+		bpf_printk("tmp_hash[%d] hash[%d] vaild[%d]\n", tmp_hash, hash, vaild);
+		if (tmp_hash == hash && diff && vaild) {
+			pctx->hash = tmp_hash;
 			bpf_tail_call(skb, &tc_progs, BRC_PROG_TC_PREPARE_PACKET);
 		}
 		// 能到这里证明对应entry有效，但是于get中的key不匹配
@@ -354,14 +360,73 @@ int brc_hash_keys_main(struct __sk_buff *skb) {
 
 SEC("tc/brc_prepare_packet")
 int brc_prepare_packet_main(struct __sk_buff *skb) {
+	void *data_end = (void *)(long)skb->data_end;
+	void *data = (void *)(long)skb->data;
+	void *old_data = data + ADJUST_HEAD_LEN;
+	struct ethhdr *eth = data;
+	struct iphdr *ip = data + sizeof(*eth);
+	void *transp = data + sizeof(*eth) + sizeof(*ip);
+	struct tcphdr *tcp;
+	bpf_printk("this is brc_prepare_packet\n");
 
-	return XDP_PASS;
+	// 这里必须要先验证ip + 1 > data_end，才能执行后面
+	if (ip + 1 > data_end || ip->protocol != IPPROTO_TCP)
+		return 0;
+
+	tcp = (struct tcphdr *) transp;
+	if (tcp + 1 > data_end)
+		return 0;
+
+	unsigned char tmp_mac[ETH_ALEN];
+	__be32 tmp_ip;
+	__be16 tmp_port;
+
+	// tmp_mac存的是源mac地址
+	memcpy(tmp_mac, eth->h_source, ETH_ALEN);
+	// 源地址改成旧包的目的地址
+	memcpy(eth->h_source, eth->h_dest, ETH_ALEN);
+	// 目的地址改成以前的源地址
+	memcpy(eth->h_dest, tmp_mac, ETH_ALEN);
+
+	// 和上面同理，交换IP和port
+	tmp_ip = ip->saddr;
+	ip->saddr = ip->daddr;
+	ip->daddr = tmp_ip;
+
+	tmp_port = tcp->source;
+	tcp->source = tcp->dest;
+	tcp->dest = tmp_port;
+
+	if (bpf_skb_adjust_room(skb, ADJUST_HEAD_LEN, BPF_ADJ_ROOM_NET, BPF_F_ADJ_ROOM_FIXED_GSO))
+		return 0;
+
+	bpf_printk("==========={%s}\n", skb->data);
+
+	bpf_tail_call(skb, &tc_progs, BRC_PROG_TC_WRITE_REPLY);
+	return 0;
+
 }
 
 SEC("tc/brc_write_reply")
 int brc_write_reply_main(struct __sk_buff *skb) {
+	// // 以这种方式扩展数据包看起来是不对的，因为我们希望的是去扩展payload，但是现在实际上扩展的是L3 layer，先试试看能不能跑通
+	// if (bpf_skb_adjust_room(skb, ADJUST_HEAD_LEN, BPF_ADJ_ROOM_NET, BPF_F_ADJ_ROOM_FIXED_GSO))
+	// 	return 0;
 
-	return XDP_PASS;
+	// struct parsing_context *pctx = bpf_map_lookup_elem(&map_parsing_context, &parsing_egress);
+	// if (!pctx) {
+	// 	return 0;
+	// }
+	// int hash = pctx->hash;
+	// u32 cache_idx = hash % BRC_CACHE_ENTRY_COUNT;
+	// bpf_printk("brc_hash_keys: hash is [%d], cache_idx is[%d] \n", hash, cache_idx);
+
+	// struct brc_cache_entry *entry = bpf_map_lookup_elem(&map_cache, &cache_idx);
+	// if (!entry) {
+	// 	return 0;
+	// }
+	// return XDP_PASS;
+	return 0;
 }
 
 SEC("tc/brc_maintain_tcp")
@@ -472,6 +537,7 @@ int brc_invalidate_cache_main(struct __sk_buff *skb) {
 
 SEC("tc/brc_tx_filter")
 int brc_tx_filter_main(struct __sk_buff *skb) {
+	// 从源码来看第二个参数填len这样的用法其实是最正确的，因为pskb_may_pull中在执行实际expend时会使用第二个参数减去线性区大小
 	bpf_skb_pull_data(skb, skb->len);
 	void *data_end = (void *)(long)skb->data_end;
 	void *data = (void *)(long)skb->data;

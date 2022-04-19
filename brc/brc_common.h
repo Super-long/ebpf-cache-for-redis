@@ -11,6 +11,8 @@
 // https://www.vbforums.com/showthread.php?879417-RESOLVED-restore-my-string-from-a-hash
 #define FNV_OFFSET_BASIS_32 	(2166136261)
 #define FNV_PRIME_32            (16777619)
+#define ETH_ALEN				(6)
+#define ADJUST_HEAD_LEN			(128)
 
 enum {
 	BRC_PROG_TC_UPDATE_CACHE = 0,

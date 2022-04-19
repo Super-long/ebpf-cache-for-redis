@@ -4,11 +4,11 @@
 2. cd brc 
 3. make
 
-在brc/.bin 中执行`sh ../restart.sh`
-在任意路径执行`sh mount.sh`
+- 在brc/.bin 中执行`sh ../restart.sh`
+- 在任意路径执行`sh mount.sh`
+- 执行`./tools/bpftool map dump name map_cache` 查看实际cache中的数据
+- 在`/tmp/brc_stats.txt`和`/tmp/brc_stats_interval.txt`中可以查看map_stats中的实时数据
 
-执行`./tools/bpftool map dump name map_cache` 查看实际cache中的数据
-在`/tmp/brc_stats.txt`和`/tmp/brc_stats_interval.txt`中可以查看map_stats中的实时数据
 ---
 # 手动编译
 
