@@ -120,18 +120,6 @@ struct brc_cache_entry {
 
 SEC("tc/brc_rx_filter")
 int brc_rx_filter_main(struct __sk_buff *skb) {
-	// static struct bpf_sock *(*bpf_skc_lookup_tcp)(void *ctx, struct bpf_sock_tuple *tuple, __u32 tuple_size, __u64 netns, __u64 flags) = (void *) 99;
-	// libbpf/src/bpf_helper_defs.h xdp/tc 支持 bpf_skc_lookup_tcp
-	// https://elixir.bootlin.com/linux/v5.17/source/tools/testing/selftests/bpf/progs/test_btf_skc_cls_ingress.c#L94 调用bpf_skc_lookup_tcp的例子
-	// vmlinux/x86/vmlinux.h cls支持 bpf_skc_lookup_tcp
-
-	// static struct bpf_tcp_sock *(*bpf_tcp_sock)(struct bpf_sock *sk) = (void *) 96;
-	// libbpf/src/bpf_helper_defs.h 支持 bpf_tcp_sock,这里返回的结构体才是需要修改的,但是只支持tc,所以看起来这里也需要使用tc
-
-	// https://elixir.bootlin.com/linux/v5.10.13/source/tools/testing/selftests/bpf/bpf_tcp_helpers.h#L53 bpf_sock定义
-
-	// btf_bpf_tcp_sock
-	// =============================================
 	void *data_end = (void *)(long)skb->data_end;
 	void *data = (void *)(long)skb->data;
 	struct ethhdr *eth = data;
@@ -291,6 +279,12 @@ int brc_hash_keys_main(struct __sk_buff *skb) {
 	if (!entry) {
 		return 0;
 	}
+
+	struct brc_stats *stats = bpf_map_lookup_elem(&map_stats, &map_stats_index);
+	if (!stats) {
+		return 0;
+	}
+
 	// 到了这里证明是个get操作，如果发现是invaild的，就把数据放入queue;如果是vaild的话就直接继续执行尾调用
 	bpf_spin_lock(&entry->lock);
 	// hash相同且字符串也一样证明找对了;vaild准备返回相关的事务;invaild pass 到用户态处理
@@ -316,9 +310,12 @@ int brc_hash_keys_main(struct __sk_buff *skb) {
 		bpf_printk("this entry idx[%d] is vaild\n", cache_idx);
 		// hash值相同且逐字节比较相同，此时开始准备返回数据包
 		bpf_printk("tmp_hash[%d] hash[%d] vaild[%d]\n", tmp_hash, hash, vaild);
+		// 这里做了比较后面的尾调用就不需要了
 		if (tmp_hash == hash && diff && vaild) {
+			stats->hit_count++;
 			pctx->hash = tmp_hash;
-			bpf_tail_call(skb, &tc_progs, BRC_PROG_TC_PREPARE_PACKET);
+			return 0;
+			//bpf_tail_call(skb, &tc_progs, BRC_PROG_TC_PREPARE_PACKET);
 		}
 		// 能到这里证明对应entry有效，但是于get中的key不匹配
 	} else {
@@ -349,10 +346,6 @@ int brc_hash_keys_main(struct __sk_buff *skb) {
 		bpf_map_push_elem(&map_invaild_key, &key_entry, BPF_ANY);
 	}
 
-	struct brc_stats *stats = bpf_map_lookup_elem(&map_stats, &map_stats_index);
-	if (!stats) {
-		return 0;
-	}
 	stats->miss_count++;
 	bpf_printk("get pass to user\n");
 	return 0;
@@ -362,7 +355,6 @@ SEC("tc/brc_prepare_packet")
 int brc_prepare_packet_main(struct __sk_buff *skb) {
 	void *data_end = (void *)(long)skb->data_end;
 	void *data = (void *)(long)skb->data;
-	void *old_data = data + ADJUST_HEAD_LEN;
 	struct ethhdr *eth = data;
 	struct iphdr *ip = data + sizeof(*eth);
 	void *transp = data + sizeof(*eth) + sizeof(*ip);
@@ -397,26 +389,53 @@ int brc_prepare_packet_main(struct __sk_buff *skb) {
 	tcp->source = tcp->dest;
 	tcp->dest = tmp_port;
 
+	// 可以用来grow和shrink，虽然从官网来看这玩意是用来修改mac和L3 layer的
 	if (bpf_skb_adjust_room(skb, ADJUST_HEAD_LEN, BPF_ADJ_ROOM_NET, BPF_F_ADJ_ROOM_FIXED_GSO))
 		return 0;
 
+	bpf_printk("brc_prepare_packet : data_end - data [%d] %d\n", data_end - data, skb->len);
 	bpf_printk("==========={%s}\n", skb->data);
 
 	bpf_tail_call(skb, &tc_progs, BRC_PROG_TC_WRITE_REPLY);
 	return 0;
-
 }
 
 SEC("tc/brc_write_reply")
 int brc_write_reply_main(struct __sk_buff *skb) {
-	// // 以这种方式扩展数据包看起来是不对的，因为我们希望的是去扩展payload，但是现在实际上扩展的是L3 layer，先试试看能不能跑通
-	// if (bpf_skb_adjust_room(skb, ADJUST_HEAD_LEN, BPF_ADJ_ROOM_NET, BPF_F_ADJ_ROOM_FIXED_GSO))
+	// void *data_end = (void *)(long)skb->data_end;
+	// void *data = (void *)(long)skb->data;
+	// struct ethhdr *eth = data;
+	// struct iphdr *ip = data + sizeof(*eth);
+	// void *transp = data + sizeof(*eth) + sizeof(*ip);
+	// struct tcphdr *tcp;
+	// bpf_printk("this is brc_prepare_packet\n");
+
+	// // 这里必须要先验证ip + 1 > data_end，才能执行后面
+	// if (ip + 1 > data_end || ip->protocol != IPPROTO_TCP)
 	// 	return 0;
 
+	// tcp = (struct tcphdr *) transp;
+	// if (tcp + 1 > data_end)
+	// 	return 0;
+	// char* payload = transp + sizeof(*tcp);
+	// int off = 0;
+	
+	// // 检查一下上一步再grow以后包中的地址设置正确
+	// bpf_printk("port: %d %d\n", bpf_ntohs(tcp->source), bpf_ntohs(tcp->dest));
+	// bpf_printk("addr: %s %s\n", bpf_ntohs(ip->saddr), bpf_ntohs(ip->daddr));
+	
+	// unsigned int parsing_egress = PARSING_INGRESS;
 	// struct parsing_context *pctx = bpf_map_lookup_elem(&map_parsing_context, &parsing_egress);
 	// if (!pctx) {
 	// 	return 0;
 	// }
+
+	// unsigned int map_stats_index = MAP_STATS;
+	// struct brc_stats *stats = bpf_map_lookup_elem(&map_stats, &map_stats_index);
+	// if (!stats) {
+	// 	return 0;
+	// }
+
 	// int hash = pctx->hash;
 	// u32 cache_idx = hash % BRC_CACHE_ENTRY_COUNT;
 	// bpf_printk("brc_hash_keys: hash is [%d], cache_idx is[%d] \n", hash, cache_idx);
@@ -425,13 +444,79 @@ int brc_write_reply_main(struct __sk_buff *skb) {
 	// if (!entry) {
 	// 	return 0;
 	// }
+	// unsigned int written = 0;
+	
+	// if (payload+off+1 <= data_end) {
+	// 	payload[0] = '$'
+	// }
+
+	// bpf_spin_lock(&entry->lock);
+	// // 前面已经检查过了，这里看起来不需要做检查了，但是先检查下其实也没什么大问题
+	// if (entry->valid && hash == entry->hash) {
+
+
+	// 	for (off = 0; off < BRC_MAX_CACHE_DATA_SIZE && off < entry->data_len && payload+off+1 <= data_end; off++) {
+	// 		payload[off] = entry->data[off];
+	// 		written += 1;
+	// 	}
+
+	// }
+	// bpf_spin_unlock(&entry->lock);
+
+	// if (payload+written+2 <= data_end) {
+	// 	payload[written++] = 'E';
+	// 	payload[written++] = 'N';
+	// 	payload[written++] = 'D';
+	// 	payload[written++] = '\r';
+	// 	payload[written++] = '\n';
+
+	// 	// 这是尾调用，不会回到调用方，所以维护一个write_pkt_offset
+	// 	if (bpf_xdp_adjust_head(ctx, 0 - (int) (sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr)
+	// 											+ sizeof(struct memcached_udp_header) + pctx->write_pkt_offset))) { // pop headers + previously written data
+	// 		return XDP_DROP;
+	// 	}
+
+	// 	void *data_end = (void *)(long)ctx->data_end;
+	// 	void *data = (void *)(long)ctx->data;
+	// 	struct iphdr *ip = data + sizeof(struct ethhdr);
+	// 	struct udphdr *udp = data + sizeof(struct ethhdr) + sizeof(*ip);
+	// 	payload = data + sizeof(struct ethhdr) + sizeof(*ip) + sizeof(*udp) + sizeof(struct memcached_udp_header);
+
+	// 	if (udp + 1 > data_end)
+	// 		return XDP_PASS;
+
+	// 	ip->tot_len = htons((payload+pctx->write_pkt_offset+written) - (char*)ip);
+	// 	ip->check = compute_ip_checksum(ip);
+	// 	// 为啥不需要
+	// 	udp->check = 0; // computing udp checksum is not required
+	// 	udp->len = htons((payload+pctx->write_pkt_offset+written) - (char*)udp);
+
+	// 	bpf_xdp_adjust_tail(ctx, 0 - (int) ((long) data_end - (long) (payload+pctx->write_pkt_offset+written))); // try to strip additional bytes
+
+	// 	return XDP_TX;
+	// }
+
+	// 以这种方式扩展数据包看起来是不对的，因为我们希望的是去扩展payload，但是现在实际上扩展的是L3 layer，先试试看能不能跑通
+	// if (bpf_skb_adjust_room(skb, ADJUST_HEAD_LEN, BPF_ADJ_ROOM_NET, BPF_F_ADJ_ROOM_FIXED_GSO))
+	// 	return 0;
 	// return XDP_PASS;
 	return 0;
 }
 
 SEC("tc/brc_maintain_tcp")
 int brc_maintain_tcp_main(struct __sk_buff *skb) {
+	// static struct bpf_sock *(*bpf_skc_lookup_tcp)(void *ctx, struct bpf_sock_tuple *tuple, __u32 tuple_size, __u64 netns, __u64 flags) = (void *) 99;
+	// libbpf/src/bpf_helper_defs.h xdp/tc 支持 bpf_skc_lookup_tcp
+	// https://elixir.bootlin.com/linux/v5.17/source/tools/testing/selftests/bpf/progs/test_btf_skc_cls_ingress.c#L94 调用bpf_skc_lookup_tcp的例子
+	// vmlinux/x86/vmlinux.h cls支持 bpf_skc_lookup_tcp
 
+	// static struct bpf_tcp_sock *(*bpf_tcp_sock)(struct bpf_sock *sk) = (void *) 96;
+	// libbpf/src/bpf_helper_defs.h 支持 bpf_tcp_sock,这里返回的结构体才是需要修改的,但是只支持tc,所以看起来这里也需要使用tc
+
+	// https://elixir.bootlin.com/linux/v5.10.13/source/tools/testing/selftests/bpf/bpf_tcp_helpers.h#L53 bpf_sock定义
+
+	// btf_bpf_tcp_sock
+	// =============================================
 	return XDP_PASS;
 }
 
@@ -643,7 +728,6 @@ int brc_tx_filter_main(struct __sk_buff *skb) {
 	}
 
 	return 0;
-	//return TC_ACT_OK;
 }
 
 SEC("tc/brc_update_cache")
