@@ -4,6 +4,8 @@
 2. cd brc 
 3. make
 
+需要修改libbpf/src/libbpf.c 中`SEC_DEF("tc",			SCHED_CLS, 0, SEC_NONE),`为`SEC_DEF("tc",			SCHED_CLS, 0, SEC_NONE | SEC_SLOPPY_PFX),`
+
 - ./redis-server 启动一个redis服务器
 - ./redis-cli CONFIG SET protected-mode no 使得其可被外网访问
 - 在brc/.bin 中执行`sh ../restart.sh`
